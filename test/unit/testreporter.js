@@ -1,87 +1,103 @@
-/* -*- Mode: Java; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
-/* vim: set shiftwidth=2 tabstop=2 autoindent cindent expandtab: */
-/*jshint globalstrict: false */
+const TestReporter = function (browser) {
+  function send(action, json) {
+    return new Promise(resolve => {
+      json.browser = browser;
 
-var TestReporter = function(browser, appPath) {
-  'use strict';
-
-  function send(action, json, cb) {
-    var r = new XMLHttpRequest();
-    // (The POST URI is ignored atm.)
-    r.open('POST', action, true);
-    r.setRequestHeader('Content-Type', 'application/json');
-    r.onreadystatechange = function sendTaskResultOnreadystatechange(e) {
-      if (r.readyState == 4) {
-        // Retry until successful
-        if (r.status !== 200) {
-          send(action, json, cb);
-        } else {
-          if (cb) {
-            cb();
+      fetch(action, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(json),
+      })
+        .then(response => {
+          // Retry until successful.
+          if (!response.ok || response.status !== 200) {
+            throw new Error(response.statusText);
           }
-        }
-      }
-    };
-    json['browser'] = browser;
-    r.send(JSON.stringify(json));
-  }
+          resolve();
+        })
+        .catch(reason => {
+          console.warn(`TestReporter - send failed (${action}): ${reason}`);
+          resolve();
 
-  function sendInfo(message) {
-    send('/info', {message: message});
-  }
-
-  function sendResult(status, description, error) {
-    var message = {
-      status: status,
-      description: description
-    };
-    if (typeof error !== 'undefined') {
-      message['error'] = error;
-    }
-    send('/submit_task_results', message);
-  }
-
-  function sendQuitRequest() {
-    send('/tellMeToQuit?path=' + escape(appPath), {}, function () {
-      if (window.SpecialPowers) {
-        SpecialPowers.quit();
-      }
+          send(action, json);
+        });
     });
   }
 
-  this.now = function() {
-    return new Date().getTime();
+  function sendInfo(message) {
+    send("/info", { message });
+  }
+
+  function sendResult(status, description, error) {
+    const message = {
+      status,
+      description,
+    };
+    if (error !== undefined) {
+      message.error = error;
+    }
+    send("/submit_task_results", message);
+  }
+
+  function sendQuitRequest() {
+    send(`/tellMeToQuit?browser=${escape(browser)}`, {});
+  }
+
+  this.now = function () {
+    return Date.now();
   };
 
-  this.reportRunnerStarting = function() {
+  this.jasmineStarted = function (suiteInfo) {
     this.runnerStartTime = this.now();
-    sendInfo('Started unit tests for ' + browser + '.');
+
+    const total = suiteInfo.totalSpecsDefined;
+    const seed = suiteInfo.order.seed;
+    sendInfo(`Started ${total} tests for ${browser} with seed ${seed}.`);
   };
 
-  this.reportSpecStarting = function() { };
-
-  this.reportSpecResults = function(spec) {
-    var results = spec.results();
-    if (results.skipped) {
-      sendResult('TEST-SKIPPED', results.description);
-    } else if (results.passed()) {
-      sendResult('TEST-PASSED', results.description);
-    } else {
-      var failedMessages = '';
-      var items = results.getItems();
-      for (var i = 0, ii = items.length; i < ii; i++) {
-        if (!items[i].passed()) {
-          failedMessages += items[i].message + ' ';
-        }
+  this.suiteStarted = function (result) {
+    // Report on the result of `beforeAll` invocations.
+    if (result.failedExpectations.length > 0) {
+      let failedMessages = "";
+      for (const item of result.failedExpectations) {
+        failedMessages += `${item.message} `;
       }
-      sendResult('TEST-UNEXPECTED-FAIL', results.description, failedMessages);
+      sendResult("TEST-UNEXPECTED-FAIL", result.description, failedMessages);
     }
   };
 
-  this.reportSuiteResults = function(suite) { };
+  this.specStarted = function (result) {};
 
-  this.reportRunnerResults = function(runner) {
-    // Give the test.py some time process any queued up requests
+  this.specDone = function (result) {
+    // Report on the result of individual tests.
+    if (result.failedExpectations.length === 0) {
+      sendResult("TEST-PASSED", result.description);
+    } else {
+      let failedMessages = "";
+      for (const item of result.failedExpectations) {
+        failedMessages += `${item.message} `;
+      }
+      sendResult("TEST-UNEXPECTED-FAIL", result.description, failedMessages);
+    }
+  };
+
+  this.suiteDone = function (result) {
+    // Report on the result of `afterAll` invocations.
+    if (result.failedExpectations.length > 0) {
+      let failedMessages = "";
+      for (const item of result.failedExpectations) {
+        failedMessages += `${item.message} `;
+      }
+      sendResult("TEST-UNEXPECTED-FAIL", result.description, failedMessages);
+    }
+  };
+
+  this.jasmineDone = function () {
+    // Give the test runner some time process any queued requests.
     setTimeout(sendQuitRequest, 500);
   };
 };
+
+export { TestReporter };

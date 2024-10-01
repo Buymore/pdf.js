@@ -1,5 +1,3 @@
-/* -*- Mode: Java; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
-/* vim: set shiftwidth=2 tabstop=2 autoindent cindent expandtab: */
 /* Copyright 2012 Mozilla Foundation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,18 +12,103 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-/* globals Cmd, ColorSpace, Dict, MozBlobBuilder, Name, PDFJS, Ref, URL,
-           Promise */
+/* globals process */
 
-'use strict';
+// NW.js / Electron is a browser context, but copies some Node.js objects; see
+// http://docs.nwjs.io/en/latest/For%20Users/Advanced/JavaScript%20Contexts%20in%20NW.js/#access-nodejs-and-nwjs-api-in-browser-context
+// https://www.electronjs.org/docs/api/process#processversionselectron-readonly
+// https://www.electronjs.org/docs/api/process#processtype-readonly
+const isNodeJS =
+  (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) &&
+  typeof process === "object" &&
+  process + "" === "[object process]" &&
+  !process.versions.nw &&
+  !(process.versions.electron && process.type && process.type !== "browser");
 
-var globalScope = (typeof window === 'undefined') ? this : window;
+const IDENTITY_MATRIX = [1, 0, 0, 1, 0, 0];
+const FONT_IDENTITY_MATRIX = [0.001, 0, 0, 0.001, 0, 0];
 
-var isWorker = (typeof window == 'undefined');
+const MAX_IMAGE_SIZE_TO_CACHE = 10e6; // Ten megabytes.
 
-var FONT_IDENTITY_MATRIX = [0.001, 0, 0, 0.001, 0, 0];
+// Represent the percentage of the height of a single-line field over
+// the font size. Acrobat seems to use this value.
+const LINE_FACTOR = 1.35;
+const LINE_DESCENT_FACTOR = 0.35;
+const BASELINE_FACTOR = LINE_DESCENT_FACTOR / LINE_FACTOR;
 
-var TextRenderingMode = {
+/**
+ * Refer to the `WorkerTransport.getRenderingIntent`-method in the API, to see
+ * how these flags are being used:
+ *  - ANY, DISPLAY, and PRINT are the normal rendering intents, note the
+ *    `PDFPageProxy.{render, getOperatorList, getAnnotations}`-methods.
+ *  - SAVE is used, on the worker-thread, when saving modified annotations.
+ *  - ANNOTATIONS_FORMS, ANNOTATIONS_STORAGE, ANNOTATIONS_DISABLE control which
+ *    annotations are rendered onto the canvas (i.e. by being included in the
+ *    operatorList), note the `PDFPageProxy.{render, getOperatorList}`-methods
+ *    and their `annotationMode`-option.
+ *  - IS_EDITING is used when editing is active in the viewer.
+ *  - OPLIST is used with the `PDFPageProxy.getOperatorList`-method, note the
+ *    `OperatorList`-constructor (on the worker-thread).
+ */
+const RenderingIntentFlag = {
+  ANY: 0x01,
+  DISPLAY: 0x02,
+  PRINT: 0x04,
+  SAVE: 0x08,
+  ANNOTATIONS_FORMS: 0x10,
+  ANNOTATIONS_STORAGE: 0x20,
+  ANNOTATIONS_DISABLE: 0x40,
+  IS_EDITING: 0x80,
+  OPLIST: 0x100,
+};
+
+const AnnotationMode = {
+  DISABLE: 0,
+  ENABLE: 1,
+  ENABLE_FORMS: 2,
+  ENABLE_STORAGE: 3,
+};
+
+const AnnotationEditorPrefix = "pdfjs_internal_editor_";
+
+const AnnotationEditorType = {
+  DISABLE: -1,
+  NONE: 0,
+  FREETEXT: 3,
+  HIGHLIGHT: 9,
+  STAMP: 13,
+  INK: 15,
+};
+
+const AnnotationEditorParamsType = {
+  RESIZE: 1,
+  CREATE: 2,
+  FREETEXT_SIZE: 11,
+  FREETEXT_COLOR: 12,
+  FREETEXT_OPACITY: 13,
+  INK_COLOR: 21,
+  INK_THICKNESS: 22,
+  INK_OPACITY: 23,
+  HIGHLIGHT_COLOR: 31,
+  HIGHLIGHT_DEFAULT_COLOR: 32,
+  HIGHLIGHT_THICKNESS: 33,
+  HIGHLIGHT_FREE: 34,
+  HIGHLIGHT_SHOW_ALL: 35,
+};
+
+// Permission flags from Table 22, Section 7.6.3.2 of the PDF specification.
+const PermissionFlag = {
+  PRINT: 0x04,
+  MODIFY_CONTENTS: 0x08,
+  COPY: 0x10,
+  MODIFY_ANNOTATIONS: 0x20,
+  FILL_INTERACTIVE_FORMS: 0x100,
+  COPY_FOR_ACCESSIBILITY: 0x200,
+  ASSEMBLE: 0x400,
+  PRINT_HIGH_QUALITY: 0x800,
+};
+
+const TextRenderingMode = {
   FILL: 0,
   STROKE: 1,
   FILL_STROKE: 2,
@@ -35,67 +118,139 @@ var TextRenderingMode = {
   FILL_STROKE_ADD_TO_PATH: 6,
   ADD_TO_PATH: 7,
   FILL_STROKE_MASK: 3,
-  ADD_TO_PATH_FLAG: 4
+  ADD_TO_PATH_FLAG: 4,
 };
 
-var ImageKind = {
+const ImageKind = {
   GRAYSCALE_1BPP: 1,
   RGB_24BPP: 2,
-  RGBA_32BPP: 3
+  RGBA_32BPP: 3,
 };
 
-var AnnotationType = {
-  WIDGET: 1,
-  TEXT: 2,
-  LINK: 3
+const AnnotationType = {
+  TEXT: 1,
+  LINK: 2,
+  FREETEXT: 3,
+  LINE: 4,
+  SQUARE: 5,
+  CIRCLE: 6,
+  POLYGON: 7,
+  POLYLINE: 8,
+  HIGHLIGHT: 9,
+  UNDERLINE: 10,
+  SQUIGGLY: 11,
+  STRIKEOUT: 12,
+  STAMP: 13,
+  CARET: 14,
+  INK: 15,
+  POPUP: 16,
+  FILEATTACHMENT: 17,
+  SOUND: 18,
+  MOVIE: 19,
+  WIDGET: 20,
+  SCREEN: 21,
+  PRINTERMARK: 22,
+  TRAPNET: 23,
+  WATERMARK: 24,
+  THREED: 25,
+  REDACT: 26,
 };
 
-var StreamType = {
-  UNKNOWN: 0,
-  FLATE: 1,
-  LZW: 2,
-  DCT: 3,
-  JPX: 4,
-  JBIG: 5,
-  A85: 6,
-  AHX: 7,
-  CCF: 8,
-  RL: 9
+const AnnotationReplyType = {
+  GROUP: "Group",
+  REPLY: "R",
 };
 
-var FontType = {
-  UNKNOWN: 0,
-  TYPE1: 1,
-  TYPE1C: 2,
-  CIDFONTTYPE0: 3,
-  CIDFONTTYPE0C: 4,
-  TRUETYPE: 5,
-  CIDFONTTYPE2: 6,
-  TYPE3: 7,
-  OPENTYPE: 8,
-  TYPE0: 9,
-  MMTYPE1: 10
+const AnnotationFlag = {
+  INVISIBLE: 0x01,
+  HIDDEN: 0x02,
+  PRINT: 0x04,
+  NOZOOM: 0x08,
+  NOROTATE: 0x10,
+  NOVIEW: 0x20,
+  READONLY: 0x40,
+  LOCKED: 0x80,
+  TOGGLENOVIEW: 0x100,
+  LOCKEDCONTENTS: 0x200,
 };
 
-// The global PDFJS object exposes the API
-// In production, it will be declared outside a global wrapper
-// In development, it will be declared here
-if (!globalScope.PDFJS) {
-  globalScope.PDFJS = {};
-}
+const AnnotationFieldFlag = {
+  READONLY: 0x0000001,
+  REQUIRED: 0x0000002,
+  NOEXPORT: 0x0000004,
+  MULTILINE: 0x0001000,
+  PASSWORD: 0x0002000,
+  NOTOGGLETOOFF: 0x0004000,
+  RADIO: 0x0008000,
+  PUSHBUTTON: 0x0010000,
+  COMBO: 0x0020000,
+  EDIT: 0x0040000,
+  SORT: 0x0080000,
+  FILESELECT: 0x0100000,
+  MULTISELECT: 0x0200000,
+  DONOTSPELLCHECK: 0x0400000,
+  DONOTSCROLL: 0x0800000,
+  COMB: 0x1000000,
+  RICHTEXT: 0x2000000,
+  RADIOSINUNISON: 0x2000000,
+  COMMITONSELCHANGE: 0x4000000,
+};
 
-globalScope.PDFJS.pdfBug = false;
+const AnnotationBorderStyleType = {
+  SOLID: 1,
+  DASHED: 2,
+  BEVELED: 3,
+  INSET: 4,
+  UNDERLINE: 5,
+};
 
-PDFJS.VERBOSITY_LEVELS = {
-  errors: 0,
-  warnings: 1,
-  infos: 5
+const AnnotationActionEventType = {
+  E: "Mouse Enter",
+  X: "Mouse Exit",
+  D: "Mouse Down",
+  U: "Mouse Up",
+  Fo: "Focus",
+  Bl: "Blur",
+  PO: "PageOpen",
+  PC: "PageClose",
+  PV: "PageVisible",
+  PI: "PageInvisible",
+  K: "Keystroke",
+  F: "Format",
+  V: "Validate",
+  C: "Calculate",
+};
+
+const DocumentActionEventType = {
+  WC: "WillClose",
+  WS: "WillSave",
+  DS: "DidSave",
+  WP: "WillPrint",
+  DP: "DidPrint",
+};
+
+const PageActionEventType = {
+  O: "PageOpen",
+  C: "PageClose",
+};
+
+const VerbosityLevel = {
+  ERRORS: 0,
+  WARNINGS: 1,
+  INFOS: 5,
+};
+
+const CMapCompressionType = {
+  NONE: 0,
+  BINARY: 1,
 };
 
 // All the possible operations for an operator list.
-var OPS = PDFJS.OPS = {
+const OPS = {
   // Intentionally start from 1 so it is easy to spot bad operators that will be
   // 0's.
+  // PLEASE NOTE: We purposely keep any removed operators commented out, since
+  //              re-numbering the list would risk breaking third-party users.
   dependency: 1,
   setLineWidth: 2,
   setLineCap: 3,
@@ -173,11 +328,11 @@ var OPS = PDFJS.OPS = {
   paintFormXObjectEnd: 75,
   beginGroup: 76,
   endGroup: 77,
-  beginAnnotations: 78,
-  endAnnotations: 79,
+  // beginAnnotations: 78,
+  // endAnnotations: 79,
   beginAnnotation: 80,
   endAnnotation: 81,
-  paintJpegXObject: 82,
+  // paintJpegXObject: 82,
   paintImageMaskXObject: 83,
   paintImageMaskXObjectGroup: 84,
   paintImageXObject: 85,
@@ -186,477 +341,456 @@ var OPS = PDFJS.OPS = {
   paintImageXObjectRepeat: 88,
   paintImageMaskXObjectRepeat: 89,
   paintSolidColorImageMask: 90,
-  constructPath: 91
+  constructPath: 91,
+  setStrokeTransparent: 92,
+  setFillTransparent: 93,
 };
+
+const PasswordResponses = {
+  NEED_PASSWORD: 1,
+  INCORRECT_PASSWORD: 2,
+};
+
+let verbosity = VerbosityLevel.WARNINGS;
+
+function setVerbosityLevel(level) {
+  if (Number.isInteger(level)) {
+    verbosity = level;
+  }
+}
+
+function getVerbosityLevel() {
+  return verbosity;
+}
 
 // A notice for devs. These are good for things that are helpful to devs, such
 // as warning that Workers were disabled, which is important to devs but not
 // end users.
 function info(msg) {
-  if (PDFJS.verbosity >= PDFJS.VERBOSITY_LEVELS.infos) {
-    console.log('Info: ' + msg);
+  if (verbosity >= VerbosityLevel.INFOS) {
+    console.log(`Info: ${msg}`);
   }
 }
 
 // Non-fatal warnings.
 function warn(msg) {
-  if (PDFJS.verbosity >= PDFJS.VERBOSITY_LEVELS.warnings) {
-    console.log('Warning: ' + msg);
+  if (verbosity >= VerbosityLevel.WARNINGS) {
+    console.log(`Warning: ${msg}`);
   }
 }
 
-// Fatal errors that should trigger the fallback UI and halt execution by
-// throwing an exception.
-function error(msg) {
-  // If multiple arguments were passed, pass them all to the log function.
-  if (arguments.length > 1) {
-    var logArguments = ['Error:'];
-    logArguments.push.apply(logArguments, arguments);
-    console.log.apply(console, logArguments);
-    // Join the arguments into a single string for the lines below.
-    msg = [].join.call(arguments, ' ');
-  } else {
-    console.log('Error: ' + msg);
-  }
-  console.log(backtrace());
-  UnsupportedManager.notify(UNSUPPORTED_FEATURES.unknown);
+function unreachable(msg) {
   throw new Error(msg);
-}
-
-function backtrace() {
-  try {
-    throw new Error();
-  } catch (e) {
-    return e.stack ? e.stack.split('\n').slice(2).join('\n') : '';
-  }
 }
 
 function assert(cond, msg) {
   if (!cond) {
-    error(msg);
+    unreachable(msg);
   }
 }
 
-var UNSUPPORTED_FEATURES = PDFJS.UNSUPPORTED_FEATURES = {
-  unknown: 'unknown',
-  forms: 'forms',
-  javaScript: 'javaScript',
-  smask: 'smask',
-  shadingPattern: 'shadingPattern',
-  font: 'font'
-};
-
-var UnsupportedManager = PDFJS.UnsupportedManager =
-  (function UnsupportedManagerClosure() {
-  var listeners = [];
-  return {
-    listen: function (cb) {
-      listeners.push(cb);
-    },
-    notify: function (featureId) {
-      warn('Unsupported feature "' + featureId + '"');
-      for (var i = 0, ii = listeners.length; i < ii; i++) {
-        listeners[i](featureId);
-      }
-    }
-  };
-})();
-
-// Combines two URLs. The baseUrl shall be absolute URL. If the url is an
-// absolute URL, it will be returned as is.
-function combineUrl(baseUrl, url) {
-  if (!url) {
-    return baseUrl;
-  }
-  if (/^[a-z][a-z0-9+\-.]*:/i.test(url)) {
-    return url;
-  }
-  var i;
-  if (url.charAt(0) == '/') {
-    // absolute path
-    i = baseUrl.indexOf('://');
-    if (url.charAt(1) === '/') {
-      ++i;
-    } else {
-      i = baseUrl.indexOf('/', i + 3);
-    }
-    return baseUrl.substring(0, i) + url;
-  } else {
-    // relative path
-    var pathLength = baseUrl.length;
-    i = baseUrl.lastIndexOf('#');
-    pathLength = i >= 0 ? i : pathLength;
-    i = baseUrl.lastIndexOf('?', pathLength);
-    pathLength = i >= 0 ? i : pathLength;
-    var prefixLength = baseUrl.lastIndexOf('/', pathLength);
-    return baseUrl.substring(0, prefixLength + 1) + url;
-  }
-}
-
-// Validates if URL is safe and allowed, e.g. to avoid XSS.
-function isValidUrl(url, allowRelative) {
-  if (!url) {
-    return false;
-  }
-  // RFC 3986 (http://tools.ietf.org/html/rfc3986#section-3.1)
-  // scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
-  var protocol = /^[a-z][a-z0-9+\-.]*(?=:)/i.exec(url);
-  if (!protocol) {
-    return allowRelative;
-  }
-  protocol = protocol[0].toLowerCase();
-  switch (protocol) {
-    case 'http':
-    case 'https':
-    case 'ftp':
-    case 'mailto':
+// Checks if URLs use one of the allowed protocols, e.g. to avoid XSS.
+function _isValidProtocol(url) {
+  switch (url?.protocol) {
+    case "http:":
+    case "https:":
+    case "ftp:":
+    case "mailto:":
+    case "tel:":
       return true;
     default:
       return false;
   }
 }
-PDFJS.isValidUrl = isValidUrl;
 
-function shadow(obj, prop, value) {
-  Object.defineProperty(obj, prop, { value: value,
-                                     enumerable: true,
-                                     configurable: true,
-                                     writable: false });
+/**
+ * Attempts to create a valid absolute URL.
+ *
+ * @param {URL|string} url - An absolute, or relative, URL.
+ * @param {URL|string} [baseUrl] - An absolute URL.
+ * @param {Object} [options]
+ * @returns Either a valid {URL}, or `null` otherwise.
+ */
+function createValidAbsoluteUrl(url, baseUrl = null, options = null) {
+  if (!url) {
+    return null;
+  }
+  try {
+    if (options && typeof url === "string") {
+      // Let URLs beginning with "www." default to using the "http://" protocol.
+      if (options.addDefaultProtocol && url.startsWith("www.")) {
+        const dots = url.match(/\./g);
+        // Avoid accidentally matching a *relative* URL pointing to a file named
+        // e.g. "www.pdf" or similar.
+        if (dots?.length >= 2) {
+          url = `http://${url}`;
+        }
+      }
+
+      // According to ISO 32000-1:2008, section 12.6.4.7, URIs should be encoded
+      // in 7-bit ASCII. Some bad PDFs use UTF-8 encoding; see bug 1122280.
+      if (options.tryConvertEncoding) {
+        try {
+          url = stringToUTF8String(url);
+        } catch {}
+      }
+    }
+
+    const absoluteUrl = baseUrl ? new URL(url, baseUrl) : new URL(url);
+    if (_isValidProtocol(absoluteUrl)) {
+      return absoluteUrl;
+    }
+  } catch {
+    /* `new URL()` will throw on incorrect data. */
+  }
+  return null;
+}
+
+function shadow(obj, prop, value, nonSerializable = false) {
+  if (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) {
+    assert(
+      prop in obj,
+      `shadow: Property "${prop && prop.toString()}" not found in object.`
+    );
+  }
+  Object.defineProperty(obj, prop, {
+    value,
+    enumerable: !nonSerializable,
+    configurable: true,
+    writable: false,
+  });
   return value;
 }
 
-var PasswordResponses = PDFJS.PasswordResponses = {
-  NEED_PASSWORD: 1,
-  INCORRECT_PASSWORD: 2
-};
+/**
+ * @type {any}
+ */
+const BaseException = (function BaseExceptionClosure() {
+  // eslint-disable-next-line no-shadow
+  function BaseException(message, name) {
+    if (
+      (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) &&
+      this.constructor === BaseException
+    ) {
+      unreachable("Cannot initialize BaseException.");
+    }
+    this.message = message;
+    this.name = name;
+  }
+  BaseException.prototype = new Error();
+  BaseException.constructor = BaseException;
 
-var PasswordException = (function PasswordExceptionClosure() {
-  function PasswordException(msg, code) {
-    this.name = 'PasswordException';
-    this.message = msg;
+  return BaseException;
+})();
+
+class PasswordException extends BaseException {
+  constructor(msg, code) {
+    super(msg, "PasswordException");
     this.code = code;
   }
+}
 
-  PasswordException.prototype = new Error();
-  PasswordException.constructor = PasswordException;
-
-  return PasswordException;
-})();
-
-var UnknownErrorException = (function UnknownErrorExceptionClosure() {
-  function UnknownErrorException(msg, details) {
-    this.name = 'UnknownErrorException';
-    this.message = msg;
+class UnknownErrorException extends BaseException {
+  constructor(msg, details) {
+    super(msg, "UnknownErrorException");
     this.details = details;
   }
+}
 
-  UnknownErrorException.prototype = new Error();
-  UnknownErrorException.constructor = UnknownErrorException;
-
-  return UnknownErrorException;
-})();
-
-var InvalidPDFException = (function InvalidPDFExceptionClosure() {
-  function InvalidPDFException(msg) {
-    this.name = 'InvalidPDFException';
-    this.message = msg;
+class InvalidPDFException extends BaseException {
+  constructor(msg) {
+    super(msg, "InvalidPDFException");
   }
+}
 
-  InvalidPDFException.prototype = new Error();
-  InvalidPDFException.constructor = InvalidPDFException;
-
-  return InvalidPDFException;
-})();
-
-var MissingPDFException = (function MissingPDFExceptionClosure() {
-  function MissingPDFException(msg) {
-    this.name = 'MissingPDFException';
-    this.message = msg;
+class MissingPDFException extends BaseException {
+  constructor(msg) {
+    super(msg, "MissingPDFException");
   }
+}
 
-  MissingPDFException.prototype = new Error();
-  MissingPDFException.constructor = MissingPDFException;
-
-  return MissingPDFException;
-})();
-
-var NotImplementedException = (function NotImplementedExceptionClosure() {
-  function NotImplementedException(msg) {
-    this.message = msg;
+class UnexpectedResponseException extends BaseException {
+  constructor(msg, status) {
+    super(msg, "UnexpectedResponseException");
+    this.status = status;
   }
+}
 
-  NotImplementedException.prototype = new Error();
-  NotImplementedException.prototype.name = 'NotImplementedException';
-  NotImplementedException.constructor = NotImplementedException;
-
-  return NotImplementedException;
-})();
-
-var MissingDataException = (function MissingDataExceptionClosure() {
-  function MissingDataException(begin, end) {
-    this.begin = begin;
-    this.end = end;
-    this.message = 'Missing data [' + begin + ', ' + end + ')';
+/**
+ * Error caused during parsing PDF data.
+ */
+class FormatError extends BaseException {
+  constructor(msg) {
+    super(msg, "FormatError");
   }
+}
 
-  MissingDataException.prototype = new Error();
-  MissingDataException.prototype.name = 'MissingDataException';
-  MissingDataException.constructor = MissingDataException;
-
-  return MissingDataException;
-})();
-
-var XRefParseException = (function XRefParseExceptionClosure() {
-  function XRefParseException(msg) {
-    this.message = msg;
+/**
+ * Error used to indicate task cancellation.
+ */
+class AbortException extends BaseException {
+  constructor(msg) {
+    super(msg, "AbortException");
   }
-
-  XRefParseException.prototype = new Error();
-  XRefParseException.prototype.name = 'XRefParseException';
-  XRefParseException.constructor = XRefParseException;
-
-  return XRefParseException;
-})();
-
+}
 
 function bytesToString(bytes) {
-  var length = bytes.length;
-  var MAX_ARGUMENT_COUNT = 8192;
+  if (typeof bytes !== "object" || bytes?.length === undefined) {
+    unreachable("Invalid argument for bytesToString");
+  }
+  const length = bytes.length;
+  const MAX_ARGUMENT_COUNT = 8192;
   if (length < MAX_ARGUMENT_COUNT) {
     return String.fromCharCode.apply(null, bytes);
   }
-  var strBuf = [];
-  for (var i = 0; i < length; i += MAX_ARGUMENT_COUNT) {
-    var chunkEnd = Math.min(i + MAX_ARGUMENT_COUNT, length);
-    var chunk = bytes.subarray(i, chunkEnd);
+  const strBuf = [];
+  for (let i = 0; i < length; i += MAX_ARGUMENT_COUNT) {
+    const chunkEnd = Math.min(i + MAX_ARGUMENT_COUNT, length);
+    const chunk = bytes.subarray(i, chunkEnd);
     strBuf.push(String.fromCharCode.apply(null, chunk));
   }
-  return strBuf.join('');
-}
-
-function stringToArray(str) {
-  var length = str.length;
-  var array = [];
-  for (var i = 0; i < length; ++i) {
-    array[i] = str.charCodeAt(i);
-  }
-  return array;
+  return strBuf.join("");
 }
 
 function stringToBytes(str) {
-  var length = str.length;
-  var bytes = new Uint8Array(length);
-  for (var i = 0; i < length; ++i) {
-    bytes[i] = str.charCodeAt(i) & 0xFF;
+  if (typeof str !== "string") {
+    unreachable("Invalid argument for stringToBytes");
+  }
+  const length = str.length;
+  const bytes = new Uint8Array(length);
+  for (let i = 0; i < length; ++i) {
+    bytes[i] = str.charCodeAt(i) & 0xff;
   }
   return bytes;
 }
 
 function string32(value) {
-  return String.fromCharCode((value >> 24) & 0xff, (value >> 16) & 0xff,
-                             (value >> 8) & 0xff, value & 0xff);
-}
-
-function log2(x) {
-  var n = 1, i = 0;
-  while (x > n) {
-    n <<= 1;
-    i++;
+  if (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) {
+    assert(
+      typeof value === "number" && Math.abs(value) < 2 ** 32,
+      `string32: Unexpected input "${value}".`
+    );
   }
-  return i;
+  return String.fromCharCode(
+    (value >> 24) & 0xff,
+    (value >> 16) & 0xff,
+    (value >> 8) & 0xff,
+    value & 0xff
+  );
 }
 
-function readInt8(data, start) {
-  return (data[start] << 24) >> 24;
+function objectSize(obj) {
+  return Object.keys(obj).length;
 }
 
-function readUint16(data, offset) {
-  return (data[offset] << 8) | data[offset + 1];
+// Ensure that the returned Object has a `null` prototype; hence why
+// `Object.fromEntries(...)` is not used.
+function objectFromMap(map) {
+  const obj = Object.create(null);
+  for (const [key, value] of map) {
+    obj[key] = value;
+  }
+  return obj;
 }
 
-function readUint32(data, offset) {
-  return ((data[offset] << 24) | (data[offset + 1] << 16) |
-         (data[offset + 2] << 8) | data[offset + 3]) >>> 0;
-}
-
-// Lazy test the endianness of the platform
-// NOTE: This will be 'true' for simulated TypedArrays
+// Checks the endianness of the platform.
 function isLittleEndian() {
-  var buffer8 = new Uint8Array(2);
+  const buffer8 = new Uint8Array(4);
   buffer8[0] = 1;
-  var buffer16 = new Uint16Array(buffer8.buffer);
-  return (buffer16[0] === 1);
+  const view32 = new Uint32Array(buffer8.buffer, 0, 1);
+  return view32[0] === 1;
 }
 
-Object.defineProperty(PDFJS, 'isLittleEndian', {
-  configurable: true,
-  get: function PDFJS_isLittleEndian() {
-    return shadow(PDFJS, 'isLittleEndian', isLittleEndian());
+// Checks if it's possible to eval JS expressions.
+function isEvalSupported() {
+  try {
+    new Function(""); // eslint-disable-line no-new, no-new-func
+    return true;
+  } catch {
+    return false;
   }
-});
-
-//#if !(FIREFOX || MOZCENTRAL || B2G || CHROME)
-//// Lazy test if the userAgant support CanvasTypedArrays
-function hasCanvasTypedArrays() {
-  var canvas = document.createElement('canvas');
-  canvas.width = canvas.height = 1;
-  var ctx = canvas.getContext('2d');
-  var imageData = ctx.createImageData(1, 1);
-  return (typeof imageData.data.buffer !== 'undefined');
 }
 
-Object.defineProperty(PDFJS, 'hasCanvasTypedArrays', {
-  configurable: true,
-  get: function PDFJS_hasCanvasTypedArrays() {
-    return shadow(PDFJS, 'hasCanvasTypedArrays', hasCanvasTypedArrays());
-  }
-});
-
-var Uint32ArrayView = (function Uint32ArrayViewClosure() {
-
-  function Uint32ArrayView(buffer, length) {
-    this.buffer = buffer;
-    this.byteLength = buffer.length;
-    this.length = length === undefined ? (this.byteLength >> 2) : length;
-    ensureUint32ArrayViewProps(this.length);
-  }
-  Uint32ArrayView.prototype = Object.create(null);
-
-  var uint32ArrayViewSetters = 0;
-  function createUint32ArrayProp(index) {
-    return {
-      get: function () {
-        var buffer = this.buffer, offset = index << 2;
-        return (buffer[offset] | (buffer[offset + 1] << 8) |
-          (buffer[offset + 2] << 16) | (buffer[offset + 3] << 24)) >>> 0;
-      },
-      set: function (value) {
-        var buffer = this.buffer, offset = index << 2;
-        buffer[offset] = value & 255;
-        buffer[offset + 1] = (value >> 8) & 255;
-        buffer[offset + 2] = (value >> 16) & 255;
-        buffer[offset + 3] = (value >>> 24) & 255;
-      }
-    };
+class FeatureTest {
+  static get isLittleEndian() {
+    return shadow(this, "isLittleEndian", isLittleEndian());
   }
 
-  function ensureUint32ArrayViewProps(length) {
-    while (uint32ArrayViewSetters < length) {
-      Object.defineProperty(Uint32ArrayView.prototype,
-        uint32ArrayViewSetters,
-        createUint32ArrayProp(uint32ArrayViewSetters));
-      uint32ArrayViewSetters++;
+  static get isEvalSupported() {
+    return shadow(this, "isEvalSupported", isEvalSupported());
+  }
+
+  static get isOffscreenCanvasSupported() {
+    return shadow(
+      this,
+      "isOffscreenCanvasSupported",
+      typeof OffscreenCanvas !== "undefined"
+    );
+  }
+
+  static get platform() {
+    if (
+      (typeof PDFJSDev !== "undefined" && PDFJSDev.test("MOZCENTRAL")) ||
+      (typeof navigator !== "undefined" &&
+        typeof navigator?.platform === "string")
+    ) {
+      return shadow(this, "platform", {
+        isMac: navigator.platform.includes("Mac"),
+      });
     }
+    return shadow(this, "platform", { isMac: false });
   }
 
-  return Uint32ArrayView;
-})();
-//#else
-//PDFJS.hasCanvasTypedArrays = true;
-//#endif
+  static get isCSSRoundSupported() {
+    return shadow(
+      this,
+      "isCSSRoundSupported",
+      globalThis.CSS?.supports?.("width: round(1.5px, 1px)")
+    );
+  }
+}
 
-var IDENTITY_MATRIX = [1, 0, 0, 1, 0, 0];
+const hexNumbers = Array.from(Array(256).keys(), n =>
+  n.toString(16).padStart(2, "0")
+);
 
-var Util = PDFJS.Util = (function UtilClosure() {
-  function Util() {}
+class Util {
+  static makeHexColor(r, g, b) {
+    return `#${hexNumbers[r]}${hexNumbers[g]}${hexNumbers[b]}`;
+  }
 
-  Util.makeCssRgb = function Util_makeCssRgb(rgb) {
-    return 'rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')';
-  };
+  // Apply a scaling matrix to some min/max values.
+  // If a scaling factor is negative then min and max must be
+  // swapped.
+  static scaleMinMax(transform, minMax) {
+    let temp;
+    if (transform[0]) {
+      if (transform[0] < 0) {
+        temp = minMax[0];
+        minMax[0] = minMax[2];
+        minMax[2] = temp;
+      }
+      minMax[0] *= transform[0];
+      minMax[2] *= transform[0];
+
+      if (transform[3] < 0) {
+        temp = minMax[1];
+        minMax[1] = minMax[3];
+        minMax[3] = temp;
+      }
+      minMax[1] *= transform[3];
+      minMax[3] *= transform[3];
+    } else {
+      temp = minMax[0];
+      minMax[0] = minMax[1];
+      minMax[1] = temp;
+      temp = minMax[2];
+      minMax[2] = minMax[3];
+      minMax[3] = temp;
+
+      if (transform[1] < 0) {
+        temp = minMax[1];
+        minMax[1] = minMax[3];
+        minMax[3] = temp;
+      }
+      minMax[1] *= transform[1];
+      minMax[3] *= transform[1];
+
+      if (transform[2] < 0) {
+        temp = minMax[0];
+        minMax[0] = minMax[2];
+        minMax[2] = temp;
+      }
+      minMax[0] *= transform[2];
+      minMax[2] *= transform[2];
+    }
+    minMax[0] += transform[4];
+    minMax[1] += transform[5];
+    minMax[2] += transform[4];
+    minMax[3] += transform[5];
+  }
 
   // Concatenates two transformation matrices together and returns the result.
-  Util.transform = function Util_transform(m1, m2) {
+  static transform(m1, m2) {
     return [
       m1[0] * m2[0] + m1[2] * m2[1],
       m1[1] * m2[0] + m1[3] * m2[1],
       m1[0] * m2[2] + m1[2] * m2[3],
       m1[1] * m2[2] + m1[3] * m2[3],
       m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
-      m1[1] * m2[4] + m1[3] * m2[5] + m1[5]
+      m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
     ];
-  };
+  }
 
   // For 2d affine transforms
-  Util.applyTransform = function Util_applyTransform(p, m) {
-    var xt = p[0] * m[0] + p[1] * m[2] + m[4];
-    var yt = p[0] * m[1] + p[1] * m[3] + m[5];
+  static applyTransform(p, m) {
+    const xt = p[0] * m[0] + p[1] * m[2] + m[4];
+    const yt = p[0] * m[1] + p[1] * m[3] + m[5];
     return [xt, yt];
-  };
+  }
 
-  Util.applyInverseTransform = function Util_applyInverseTransform(p, m) {
-    var d = m[0] * m[3] - m[1] * m[2];
-    var xt = (p[0] * m[3] - p[1] * m[2] + m[2] * m[5] - m[4] * m[3]) / d;
-    var yt = (-p[0] * m[1] + p[1] * m[0] + m[4] * m[1] - m[5] * m[0]) / d;
+  static applyInverseTransform(p, m) {
+    const d = m[0] * m[3] - m[1] * m[2];
+    const xt = (p[0] * m[3] - p[1] * m[2] + m[2] * m[5] - m[4] * m[3]) / d;
+    const yt = (-p[0] * m[1] + p[1] * m[0] + m[4] * m[1] - m[5] * m[0]) / d;
     return [xt, yt];
-  };
+  }
 
   // Applies the transform to the rectangle and finds the minimum axially
   // aligned bounding box.
-  Util.getAxialAlignedBoundingBox =
-    function Util_getAxialAlignedBoundingBox(r, m) {
-
-    var p1 = Util.applyTransform(r, m);
-    var p2 = Util.applyTransform(r.slice(2, 4), m);
-    var p3 = Util.applyTransform([r[0], r[3]], m);
-    var p4 = Util.applyTransform([r[2], r[1]], m);
+  static getAxialAlignedBoundingBox(r, m) {
+    const p1 = this.applyTransform(r, m);
+    const p2 = this.applyTransform(r.slice(2, 4), m);
+    const p3 = this.applyTransform([r[0], r[3]], m);
+    const p4 = this.applyTransform([r[2], r[1]], m);
     return [
       Math.min(p1[0], p2[0], p3[0], p4[0]),
       Math.min(p1[1], p2[1], p3[1], p4[1]),
       Math.max(p1[0], p2[0], p3[0], p4[0]),
-      Math.max(p1[1], p2[1], p3[1], p4[1])
+      Math.max(p1[1], p2[1], p3[1], p4[1]),
     ];
-  };
+  }
 
-  Util.inverseTransform = function Util_inverseTransform(m) {
-    var d = m[0] * m[3] - m[1] * m[2];
-    return [m[3] / d, -m[1] / d, -m[2] / d, m[0] / d,
-      (m[2] * m[5] - m[4] * m[3]) / d, (m[4] * m[1] - m[5] * m[0]) / d];
-  };
-
-  // Apply a generic 3d matrix M on a 3-vector v:
-  //   | a b c |   | X |
-  //   | d e f | x | Y |
-  //   | g h i |   | Z |
-  // M is assumed to be serialized as [a,b,c,d,e,f,g,h,i],
-  // with v as [X,Y,Z]
-  Util.apply3dTransform = function Util_apply3dTransform(m, v) {
+  static inverseTransform(m) {
+    const d = m[0] * m[3] - m[1] * m[2];
     return [
-      m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
-      m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
-      m[6] * v[0] + m[7] * v[1] + m[8] * v[2]
+      m[3] / d,
+      -m[1] / d,
+      -m[2] / d,
+      m[0] / d,
+      (m[2] * m[5] - m[4] * m[3]) / d,
+      (m[4] * m[1] - m[5] * m[0]) / d,
     ];
-  };
+  }
 
   // This calculation uses Singular Value Decomposition.
   // The SVD can be represented with formula A = USV. We are interested in the
   // matrix S here because it represents the scale values.
-  Util.singularValueDecompose2dScale =
-    function Util_singularValueDecompose2dScale(m) {
-
-    var transpose = [m[0], m[2], m[1], m[3]];
+  static singularValueDecompose2dScale(m) {
+    const transpose = [m[0], m[2], m[1], m[3]];
 
     // Multiply matrix m with its transpose.
-    var a = m[0] * transpose[0] + m[1] * transpose[2];
-    var b = m[0] * transpose[1] + m[1] * transpose[3];
-    var c = m[2] * transpose[0] + m[3] * transpose[2];
-    var d = m[2] * transpose[1] + m[3] * transpose[3];
+    const a = m[0] * transpose[0] + m[1] * transpose[2];
+    const b = m[0] * transpose[1] + m[1] * transpose[3];
+    const c = m[2] * transpose[0] + m[3] * transpose[2];
+    const d = m[2] * transpose[1] + m[3] * transpose[3];
 
     // Solve the second degree polynomial to get roots.
-    var first = (a + d) / 2;
-    var second = Math.sqrt((a + d) * (a + d) - 4 * (a * d - c * b)) / 2;
-    var sx = first + second || 1;
-    var sy = first - second || 1;
+    const first = (a + d) / 2;
+    const second = Math.sqrt((a + d) ** 2 - 4 * (a * d - c * b)) / 2;
+    const sx = first + second || 1;
+    const sy = first - second || 1;
 
     // Scale values are the square roots of the eigenvalues.
     return [Math.sqrt(sx), Math.sqrt(sy)];
-  };
+  }
 
   // Normalize rectangle rect=[x1, y1, x2, y2] so that (x1,y1) < (x2,y2)
   // For coordinate systems whose origin lies in the bottom-left, this
   // means normalization to (BL,TR) ordering. For systems with origin in the
   // top-left, this means (TL,BR) ordering.
-  Util.normalizeRect = function Util_normalizeRect(rect) {
-    var r = rect.slice(0); // clone rect
+  static normalizeRect(rect) {
+    const r = rect.slice(0); // clone rect
     if (rect[0] > rect[2]) {
       r[0] = rect[2];
       r[2] = rect[0];
@@ -666,905 +800,357 @@ var Util = PDFJS.Util = (function UtilClosure() {
       r[3] = rect[1];
     }
     return r;
-  };
+  }
 
   // Returns a rectangle [x1, y1, x2, y2] corresponding to the
-  // intersection of rect1 and rect2. If no intersection, returns 'false'
+  // intersection of rect1 and rect2. If no intersection, returns 'null'
   // The rectangle coordinates of rect1, rect2 should be [x1, y1, x2, y2]
-  Util.intersect = function Util_intersect(rect1, rect2) {
-    function compare(a, b) {
-      return a - b;
-    }
-
-    // Order points along the axes
-    var orderedX = [rect1[0], rect1[2], rect2[0], rect2[2]].sort(compare),
-        orderedY = [rect1[1], rect1[3], rect2[1], rect2[3]].sort(compare),
-        result = [];
-
-    rect1 = Util.normalizeRect(rect1);
-    rect2 = Util.normalizeRect(rect2);
-
-    // X: first and second points belong to different rectangles?
-    if ((orderedX[0] === rect1[0] && orderedX[1] === rect2[0]) ||
-        (orderedX[0] === rect2[0] && orderedX[1] === rect1[0])) {
-      // Intersection must be between second and third points
-      result[0] = orderedX[1];
-      result[2] = orderedX[2];
-    } else {
-      return false;
-    }
-
-    // Y: first and second points belong to different rectangles?
-    if ((orderedY[0] === rect1[1] && orderedY[1] === rect2[1]) ||
-        (orderedY[0] === rect2[1] && orderedY[1] === rect1[1])) {
-      // Intersection must be between second and third points
-      result[1] = orderedY[1];
-      result[3] = orderedY[2];
-    } else {
-      return false;
-    }
-
-    return result;
-  };
-
-  Util.sign = function Util_sign(num) {
-    return num < 0 ? -1 : 1;
-  };
-
-  Util.appendToArray = function Util_appendToArray(arr1, arr2) {
-    Array.prototype.push.apply(arr1, arr2);
-  };
-
-  Util.prependToArray = function Util_prependToArray(arr1, arr2) {
-    Array.prototype.unshift.apply(arr1, arr2);
-  };
-
-  Util.extendObj = function extendObj(obj1, obj2) {
-    for (var key in obj2) {
-      obj1[key] = obj2[key];
-    }
-  };
-
-  Util.getInheritableProperty = function Util_getInheritableProperty(dict,
-                                                                     name) {
-    while (dict && !dict.has(name)) {
-      dict = dict.get('Parent');
-    }
-    if (!dict) {
+  static intersect(rect1, rect2) {
+    const xLow = Math.max(
+      Math.min(rect1[0], rect1[2]),
+      Math.min(rect2[0], rect2[2])
+    );
+    const xHigh = Math.min(
+      Math.max(rect1[0], rect1[2]),
+      Math.max(rect2[0], rect2[2])
+    );
+    if (xLow > xHigh) {
       return null;
     }
-    return dict.get(name);
-  };
-
-  Util.inherit = function Util_inherit(sub, base, prototype) {
-    sub.prototype = Object.create(base.prototype);
-    sub.prototype.constructor = sub;
-    for (var prop in prototype) {
-      sub.prototype[prop] = prototype[prop];
-    }
-  };
-
-  Util.loadScript = function Util_loadScript(src, callback) {
-    var script = document.createElement('script');
-    var loaded = false;
-    script.setAttribute('src', src);
-    if (callback) {
-      script.onload = function() {
-        if (!loaded) {
-          callback();
-        }
-        loaded = true;
-      };
-    }
-    document.getElementsByTagName('head')[0].appendChild(script);
-  };
-
-  return Util;
-})();
-
-/**
- * PDF page viewport created based on scale, rotation and offset.
- * @class
- * @alias PDFJS.PageViewport
- */
-var PageViewport = PDFJS.PageViewport = (function PageViewportClosure() {
-  /**
-   * @constructor
-   * @private
-   * @param viewBox {Array} xMin, yMin, xMax and yMax coordinates.
-   * @param scale {number} scale of the viewport.
-   * @param rotation {number} rotations of the viewport in degrees.
-   * @param offsetX {number} offset X
-   * @param offsetY {number} offset Y
-   * @param dontFlip {boolean} if true, axis Y will not be flipped.
-   */
-  function PageViewport(viewBox, scale, rotation, offsetX, offsetY, dontFlip) {
-    this.viewBox = viewBox;
-    this.scale = scale;
-    this.rotation = rotation;
-    this.offsetX = offsetX;
-    this.offsetY = offsetY;
-
-    // creating transform to convert pdf coordinate system to the normal
-    // canvas like coordinates taking in account scale and rotation
-    var centerX = (viewBox[2] + viewBox[0]) / 2;
-    var centerY = (viewBox[3] + viewBox[1]) / 2;
-    var rotateA, rotateB, rotateC, rotateD;
-    rotation = rotation % 360;
-    rotation = rotation < 0 ? rotation + 360 : rotation;
-    switch (rotation) {
-      case 180:
-        rotateA = -1; rotateB = 0; rotateC = 0; rotateD = 1;
-        break;
-      case 90:
-        rotateA = 0; rotateB = 1; rotateC = 1; rotateD = 0;
-        break;
-      case 270:
-        rotateA = 0; rotateB = -1; rotateC = -1; rotateD = 0;
-        break;
-      //case 0:
-      default:
-        rotateA = 1; rotateB = 0; rotateC = 0; rotateD = -1;
-        break;
+    const yLow = Math.max(
+      Math.min(rect1[1], rect1[3]),
+      Math.min(rect2[1], rect2[3])
+    );
+    const yHigh = Math.min(
+      Math.max(rect1[1], rect1[3]),
+      Math.max(rect2[1], rect2[3])
+    );
+    if (yLow > yHigh) {
+      return null;
     }
 
-    if (dontFlip) {
-      rotateC = -rotateC; rotateD = -rotateD;
-    }
-
-    var offsetCanvasX, offsetCanvasY;
-    var width, height;
-    if (rotateA === 0) {
-      offsetCanvasX = Math.abs(centerY - viewBox[1]) * scale + offsetX;
-      offsetCanvasY = Math.abs(centerX - viewBox[0]) * scale + offsetY;
-      width = Math.abs(viewBox[3] - viewBox[1]) * scale;
-      height = Math.abs(viewBox[2] - viewBox[0]) * scale;
-    } else {
-      offsetCanvasX = Math.abs(centerX - viewBox[0]) * scale + offsetX;
-      offsetCanvasY = Math.abs(centerY - viewBox[1]) * scale + offsetY;
-      width = Math.abs(viewBox[2] - viewBox[0]) * scale;
-      height = Math.abs(viewBox[3] - viewBox[1]) * scale;
-    }
-    // creating transform for the following operations:
-    // translate(-centerX, -centerY), rotate and flip vertically,
-    // scale, and translate(offsetCanvasX, offsetCanvasY)
-    this.transform = [
-      rotateA * scale,
-      rotateB * scale,
-      rotateC * scale,
-      rotateD * scale,
-      offsetCanvasX - rotateA * scale * centerX - rotateC * scale * centerY,
-      offsetCanvasY - rotateB * scale * centerX - rotateD * scale * centerY
-    ];
-
-    this.width = width;
-    this.height = height;
-    this.fontScale = scale;
+    return [xLow, yLow, xHigh, yHigh];
   }
-  PageViewport.prototype = /** @lends PDFJS.PageViewport.prototype */ {
-    /**
-     * Clones viewport with additional properties.
-     * @param args {Object} (optional) If specified, may contain the 'scale' or
-     * 'rotation' properties to override the corresponding properties in
-     * the cloned viewport.
-     * @returns {PDFJS.PageViewport} Cloned viewport.
-     */
-    clone: function PageViewPort_clone(args) {
-      args = args || {};
-      var scale = 'scale' in args ? args.scale : this.scale;
-      var rotation = 'rotation' in args ? args.rotation : this.rotation;
-      return new PageViewport(this.viewBox.slice(), scale, rotation,
-                              this.offsetX, this.offsetY, args.dontFlip);
-    },
-    /**
-     * Converts PDF point to the viewport coordinates. For examples, useful for
-     * converting PDF location into canvas pixel coordinates.
-     * @param x {number} X coordinate.
-     * @param y {number} Y coordinate.
-     * @returns {Object} Object that contains 'x' and 'y' properties of the
-     * point in the viewport coordinate space.
-     * @see {@link convertToPdfPoint}
-     * @see {@link convertToViewportRectangle}
-     */
-    convertToViewportPoint: function PageViewport_convertToViewportPoint(x, y) {
-      return Util.applyTransform([x, y], this.transform);
-    },
-    /**
-     * Converts PDF rectangle to the viewport coordinates.
-     * @param rect {Array} xMin, yMin, xMax and yMax coordinates.
-     * @returns {Array} Contains corresponding coordinates of the rectangle
-     * in the viewport coordinate space.
-     * @see {@link convertToViewportPoint}
-     */
-    convertToViewportRectangle:
-      function PageViewport_convertToViewportRectangle(rect) {
-      var tl = Util.applyTransform([rect[0], rect[1]], this.transform);
-      var br = Util.applyTransform([rect[2], rect[3]], this.transform);
-      return [tl[0], tl[1], br[0], br[1]];
-    },
-    /**
-     * Converts viewport coordinates to the PDF location. For examples, useful
-     * for converting canvas pixel location into PDF one.
-     * @param x {number} X coordinate.
-     * @param y {number} Y coordinate.
-     * @returns {Object} Object that contains 'x' and 'y' properties of the
-     * point in the PDF coordinate space.
-     * @see {@link convertToViewportPoint}
-     */
-    convertToPdfPoint: function PageViewport_convertToPdfPoint(x, y) {
-      return Util.applyInverseTransform([x, y], this.transform);
-    }
-  };
-  return PageViewport;
-})();
 
-var PDFStringTranslateTable = [
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  0x2D8, 0x2C7, 0x2C6, 0x2D9, 0x2DD, 0x2DB, 0x2DA, 0x2DC, 0, 0, 0, 0, 0, 0, 0,
+  static #getExtremumOnCurve(x0, x1, x2, x3, y0, y1, y2, y3, t, minMax) {
+    if (t <= 0 || t >= 1) {
+      return;
+    }
+    const mt = 1 - t;
+    const tt = t * t;
+    const ttt = tt * t;
+    const x = mt * (mt * (mt * x0 + 3 * t * x1) + 3 * tt * x2) + ttt * x3;
+    const y = mt * (mt * (mt * y0 + 3 * t * y1) + 3 * tt * y2) + ttt * y3;
+    minMax[0] = Math.min(minMax[0], x);
+    minMax[1] = Math.min(minMax[1], y);
+    minMax[2] = Math.max(minMax[2], x);
+    minMax[3] = Math.max(minMax[3], y);
+  }
+
+  static #getExtremum(x0, x1, x2, x3, y0, y1, y2, y3, a, b, c, minMax) {
+    if (Math.abs(a) < 1e-12) {
+      if (Math.abs(b) >= 1e-12) {
+        this.#getExtremumOnCurve(
+          x0,
+          x1,
+          x2,
+          x3,
+          y0,
+          y1,
+          y2,
+          y3,
+          -c / b,
+          minMax
+        );
+      }
+      return;
+    }
+
+    const delta = b ** 2 - 4 * c * a;
+    if (delta < 0) {
+      return;
+    }
+    const sqrtDelta = Math.sqrt(delta);
+    const a2 = 2 * a;
+    this.#getExtremumOnCurve(
+      x0,
+      x1,
+      x2,
+      x3,
+      y0,
+      y1,
+      y2,
+      y3,
+      (-b + sqrtDelta) / a2,
+      minMax
+    );
+    this.#getExtremumOnCurve(
+      x0,
+      x1,
+      x2,
+      x3,
+      y0,
+      y1,
+      y2,
+      y3,
+      (-b - sqrtDelta) / a2,
+      minMax
+    );
+  }
+
+  // From https://github.com/adobe-webplatform/Snap.svg/blob/b365287722a72526000ac4bfcf0ce4cac2faa015/src/path.js#L852
+  static bezierBoundingBox(x0, y0, x1, y1, x2, y2, x3, y3, minMax) {
+    if (minMax) {
+      minMax[0] = Math.min(minMax[0], x0, x3);
+      minMax[1] = Math.min(minMax[1], y0, y3);
+      minMax[2] = Math.max(minMax[2], x0, x3);
+      minMax[3] = Math.max(minMax[3], y0, y3);
+    } else {
+      minMax = [
+        Math.min(x0, x3),
+        Math.min(y0, y3),
+        Math.max(x0, x3),
+        Math.max(y0, y3),
+      ];
+    }
+    this.#getExtremum(
+      x0,
+      x1,
+      x2,
+      x3,
+      y0,
+      y1,
+      y2,
+      y3,
+      3 * (-x0 + 3 * (x1 - x2) + x3),
+      6 * (x0 - 2 * x1 + x2),
+      3 * (x1 - x0),
+      minMax
+    );
+    this.#getExtremum(
+      x0,
+      x1,
+      x2,
+      x3,
+      y0,
+      y1,
+      y2,
+      y3,
+      3 * (-y0 + 3 * (y1 - y2) + y3),
+      6 * (y0 - 2 * y1 + y2),
+      3 * (y1 - y0),
+      minMax
+    );
+    return minMax;
+  }
+}
+
+const PDFStringTranslateTable = [
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2d8,
+  0x2c7, 0x2c6, 0x2d9, 0x2dd, 0x2db, 0x2da, 0x2dc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2022, 0x2020, 0x2021, 0x2026, 0x2014,
-  0x2013, 0x192, 0x2044, 0x2039, 0x203A, 0x2212, 0x2030, 0x201E, 0x201C,
-  0x201D, 0x2018, 0x2019, 0x201A, 0x2122, 0xFB01, 0xFB02, 0x141, 0x152, 0x160,
-  0x178, 0x17D, 0x131, 0x142, 0x153, 0x161, 0x17E, 0, 0x20AC
+  0, 0, 0, 0, 0, 0, 0, 0, 0x2022, 0x2020, 0x2021, 0x2026, 0x2014, 0x2013, 0x192,
+  0x2044, 0x2039, 0x203a, 0x2212, 0x2030, 0x201e, 0x201c, 0x201d, 0x2018,
+  0x2019, 0x201a, 0x2122, 0xfb01, 0xfb02, 0x141, 0x152, 0x160, 0x178, 0x17d,
+  0x131, 0x142, 0x153, 0x161, 0x17e, 0, 0x20ac,
 ];
 
 function stringToPDFString(str) {
-  var i, n = str.length, strBuf = [];
-  if (str[0] === '\xFE' && str[1] === '\xFF') {
-    // UTF16BE BOM
-    for (i = 2; i < n; i += 2) {
-      strBuf.push(String.fromCharCode(
-        (str.charCodeAt(i) << 8) | str.charCodeAt(i + 1)));
+  // See section 7.9.2.2 Text String Type.
+  // The string can contain some language codes bracketed with 0x0b,
+  // so we must remove them.
+  if (str[0] >= "\xEF") {
+    let encoding;
+    if (str[0] === "\xFE" && str[1] === "\xFF") {
+      encoding = "utf-16be";
+      if (str.length % 2 === 1) {
+        str = str.slice(0, -1);
+      }
+    } else if (str[0] === "\xFF" && str[1] === "\xFE") {
+      encoding = "utf-16le";
+      if (str.length % 2 === 1) {
+        str = str.slice(0, -1);
+      }
+    } else if (str[0] === "\xEF" && str[1] === "\xBB" && str[2] === "\xBF") {
+      encoding = "utf-8";
     }
-  } else {
-    for (i = 0; i < n; ++i) {
-      var code = PDFStringTranslateTable[str.charCodeAt(i)];
-      strBuf.push(code ? String.fromCharCode(code) : str.charAt(i));
+
+    if (encoding) {
+      try {
+        const decoder = new TextDecoder(encoding, { fatal: true });
+        const buffer = stringToBytes(str);
+        const decoded = decoder.decode(buffer);
+        if (!decoded.includes("\x1b")) {
+          return decoded;
+        }
+        return decoded.replaceAll(/\x1b[^\x1b]*(?:\x1b|$)/g, "");
+      } catch (ex) {
+        warn(`stringToPDFString: "${ex}".`);
+      }
     }
   }
-  return strBuf.join('');
+  // ISO Latin 1
+  const strBuf = [];
+  for (let i = 0, ii = str.length; i < ii; i++) {
+    const charCode = str.charCodeAt(i);
+    if (charCode === 0x1b) {
+      // eslint-disable-next-line no-empty
+      while (++i < ii && str.charCodeAt(i) !== 0x1b) {}
+      continue;
+    }
+    const code = PDFStringTranslateTable[charCode];
+    strBuf.push(code ? String.fromCharCode(code) : str.charAt(i));
+  }
+  return strBuf.join("");
 }
 
 function stringToUTF8String(str) {
   return decodeURIComponent(escape(str));
 }
 
-function isEmptyObj(obj) {
-  for (var key in obj) {
+function utf8StringToString(str) {
+  return unescape(encodeURIComponent(str));
+}
+
+function isArrayEqual(arr1, arr2) {
+  if (arr1.length !== arr2.length) {
     return false;
+  }
+  for (let i = 0, ii = arr1.length; i < ii; i++) {
+    if (arr1[i] !== arr2[i]) {
+      return false;
+    }
   }
   return true;
 }
 
-function isBool(v) {
-  return typeof v == 'boolean';
+function getModificationDate(date = new Date()) {
+  const buffer = [
+    date.getUTCFullYear().toString(),
+    (date.getUTCMonth() + 1).toString().padStart(2, "0"),
+    date.getUTCDate().toString().padStart(2, "0"),
+    date.getUTCHours().toString().padStart(2, "0"),
+    date.getUTCMinutes().toString().padStart(2, "0"),
+    date.getUTCSeconds().toString().padStart(2, "0"),
+  ];
+
+  return buffer.join("");
 }
 
-function isInt(v) {
-  return typeof v === 'number' && ((v | 0) === v);
-}
-
-function isNum(v) {
-  return typeof v === 'number';
-}
-
-function isString(v) {
-  return typeof v === 'string';
-}
-
-function isNull(v) {
-  return v === null;
-}
-
-function isName(v) {
-  return v instanceof Name;
-}
-
-function isCmd(v, cmd) {
-  return v instanceof Cmd && (cmd === undefined || v.cmd === cmd);
-}
-
-function isDict(v, type) {
-  if (!(v instanceof Dict)) {
-    return false;
+let NormalizeRegex = null;
+let NormalizationMap = null;
+function normalizeUnicode(str) {
+  if (!NormalizeRegex) {
+    // In order to generate the following regex:
+    //  - create a PDF containing all the chars in the range 0000-FFFF with
+    //    a NFKC which is different of the char.
+    //  - copy and paste all those chars and get the ones where NFKC is
+    //    required.
+    // It appears that most the chars here contain some ligatures.
+    NormalizeRegex =
+      /([\u00a0\u00b5\u037e\u0eb3\u2000-\u200a\u202f\u2126\ufb00-\ufb04\ufb06\ufb20-\ufb36\ufb38-\ufb3c\ufb3e\ufb40-\ufb41\ufb43-\ufb44\ufb46-\ufba1\ufba4-\ufba9\ufbae-\ufbb1\ufbd3-\ufbdc\ufbde-\ufbe7\ufbea-\ufbf8\ufbfc-\ufbfd\ufc00-\ufc5d\ufc64-\ufcf1\ufcf5-\ufd3d\ufd88\ufdf4\ufdfa-\ufdfb\ufe71\ufe77\ufe79\ufe7b\ufe7d]+)|(\ufb05+)/gu;
+    NormalizationMap = new Map([["ﬅ", "ſt"]]);
   }
-  if (!type) {
-    return true;
+  return str.replaceAll(NormalizeRegex, (_, p1, p2) =>
+    p1 ? p1.normalize("NFKC") : NormalizationMap.get(p2)
+  );
+}
+
+function getUuid() {
+  if (
+    (typeof PDFJSDev !== "undefined" && PDFJSDev.test("MOZCENTRAL")) ||
+    (typeof crypto !== "undefined" && typeof crypto?.randomUUID === "function")
+  ) {
+    return crypto.randomUUID();
   }
-  var dictType = v.get('Type');
-  return isName(dictType) && dictType.name === type;
-}
-
-function isArray(v) {
-  return v instanceof Array;
-}
-
-function isStream(v) {
-  return typeof v === 'object' && v !== null && v.getBytes !== undefined;
-}
-
-function isArrayBuffer(v) {
-  return typeof v === 'object' && v !== null && v.byteLength !== undefined;
-}
-
-function isRef(v) {
-  return v instanceof Ref;
-}
-
-/**
- * Promise Capability object.
- *
- * @typedef {Object} PromiseCapability
- * @property {Promise} promise - A promise object.
- * @property {function} resolve - Fullfills the promise.
- * @property {function} reject - Rejects the promise.
- */
-
-/**
- * Creates a promise capability object.
- * @alias PDFJS.createPromiseCapability
- *
- * @return {PromiseCapability} A capability object contains:
- * - a Promise, resolve and reject methods.
- */
-function createPromiseCapability() {
-  var capability = {};
-  capability.promise = new Promise(function (resolve, reject) {
-    capability.resolve = resolve;
-    capability.reject = reject;
-  });
-  return capability;
-}
-
-PDFJS.createPromiseCapability = createPromiseCapability;
-
-/**
- * Polyfill for Promises:
- * The following promise implementation tries to generally implement the
- * Promise/A+ spec. Some notable differences from other promise libaries are:
- * - There currently isn't a seperate deferred and promise object.
- * - Unhandled rejections eventually show an error if they aren't handled.
- *
- * Based off of the work in:
- * https://bugzilla.mozilla.org/show_bug.cgi?id=810490
- */
-(function PromiseClosure() {
-  if (globalScope.Promise) {
-    // Promises existing in the DOM/Worker, checking presence of all/resolve
-    if (typeof globalScope.Promise.all !== 'function') {
-      globalScope.Promise.all = function (iterable) {
-        var count = 0, results = [], resolve, reject;
-        var promise = new globalScope.Promise(function (resolve_, reject_) {
-          resolve = resolve_;
-          reject = reject_;
-        });
-        iterable.forEach(function (p, i) {
-          count++;
-          p.then(function (result) {
-            results[i] = result;
-            count--;
-            if (count === 0) {
-              resolve(results);
-            }
-          }, reject);
-        });
-        if (count === 0) {
-          resolve(results);
-        }
-        return promise;
-      };
-    }
-    if (typeof globalScope.Promise.resolve !== 'function') {
-      globalScope.Promise.resolve = function (value) {
-        return new globalScope.Promise(function (resolve) { resolve(value); });
-      };
-    }
-    if (typeof globalScope.Promise.reject !== 'function') {
-      globalScope.Promise.reject = function (reason) {
-        return new globalScope.Promise(function (resolve, reject) {
-          reject(reason);
-        });
-      };
-    }
-    if (typeof globalScope.Promise.prototype.catch !== 'function') {
-      globalScope.Promise.prototype.catch = function (onReject) {
-        return globalScope.Promise.prototype.then(undefined, onReject);
-      };
-    }
-    return;
-  }
-//#if !MOZCENTRAL
-  var STATUS_PENDING = 0;
-  var STATUS_RESOLVED = 1;
-  var STATUS_REJECTED = 2;
-
-  // In an attempt to avoid silent exceptions, unhandled rejections are
-  // tracked and if they aren't handled in a certain amount of time an
-  // error is logged.
-  var REJECTION_TIMEOUT = 500;
-
-  var HandlerManager = {
-    handlers: [],
-    running: false,
-    unhandledRejections: [],
-    pendingRejectionCheck: false,
-
-    scheduleHandlers: function scheduleHandlers(promise) {
-      if (promise._status == STATUS_PENDING) {
-        return;
-      }
-
-      this.handlers = this.handlers.concat(promise._handlers);
-      promise._handlers = [];
-
-      if (this.running) {
-        return;
-      }
-      this.running = true;
-
-      setTimeout(this.runHandlers.bind(this), 0);
-    },
-
-    runHandlers: function runHandlers() {
-      var RUN_TIMEOUT = 1; // ms
-      var timeoutAt = Date.now() + RUN_TIMEOUT;
-      while (this.handlers.length > 0) {
-        var handler = this.handlers.shift();
-
-        var nextStatus = handler.thisPromise._status;
-        var nextValue = handler.thisPromise._value;
-
-        try {
-          if (nextStatus === STATUS_RESOLVED) {
-            if (typeof(handler.onResolve) == 'function') {
-              nextValue = handler.onResolve(nextValue);
-            }
-          } else if (typeof(handler.onReject) === 'function') {
-              nextValue = handler.onReject(nextValue);
-              nextStatus = STATUS_RESOLVED;
-
-              if (handler.thisPromise._unhandledRejection) {
-                this.removeUnhandeledRejection(handler.thisPromise);
-              }
-          }
-        } catch (ex) {
-          nextStatus = STATUS_REJECTED;
-          nextValue = ex;
-        }
-
-        handler.nextPromise._updateStatus(nextStatus, nextValue);
-        if (Date.now() >= timeoutAt) {
-          break;
-        }
-      }
-
-      if (this.handlers.length > 0) {
-        setTimeout(this.runHandlers.bind(this), 0);
-        return;
-      }
-
-      this.running = false;
-    },
-
-    addUnhandledRejection: function addUnhandledRejection(promise) {
-      this.unhandledRejections.push({
-        promise: promise,
-        time: Date.now()
-      });
-      this.scheduleRejectionCheck();
-    },
-
-    removeUnhandeledRejection: function removeUnhandeledRejection(promise) {
-      promise._unhandledRejection = false;
-      for (var i = 0; i < this.unhandledRejections.length; i++) {
-        if (this.unhandledRejections[i].promise === promise) {
-          this.unhandledRejections.splice(i);
-          i--;
-        }
-      }
-    },
-
-    scheduleRejectionCheck: function scheduleRejectionCheck() {
-      if (this.pendingRejectionCheck) {
-        return;
-      }
-      this.pendingRejectionCheck = true;
-      setTimeout(function rejectionCheck() {
-        this.pendingRejectionCheck = false;
-        var now = Date.now();
-        for (var i = 0; i < this.unhandledRejections.length; i++) {
-          if (now - this.unhandledRejections[i].time > REJECTION_TIMEOUT) {
-            var unhandled = this.unhandledRejections[i].promise._value;
-            var msg = 'Unhandled rejection: ' + unhandled;
-            if (unhandled.stack) {
-              msg += '\n' + unhandled.stack;
-            }
-            warn(msg);
-            this.unhandledRejections.splice(i);
-            i--;
-          }
-        }
-        if (this.unhandledRejections.length) {
-          this.scheduleRejectionCheck();
-        }
-      }.bind(this), REJECTION_TIMEOUT);
-    }
-  };
-
-  function Promise(resolver) {
-    this._status = STATUS_PENDING;
-    this._handlers = [];
-    try {
-      resolver.call(this, this._resolve.bind(this), this._reject.bind(this));
-    } catch (e) {
-      this._reject(e);
+  const buf = new Uint8Array(32);
+  if (
+    typeof crypto !== "undefined" &&
+    typeof crypto?.getRandomValues === "function"
+  ) {
+    crypto.getRandomValues(buf);
+  } else {
+    for (let i = 0; i < 32; i++) {
+      buf[i] = Math.floor(Math.random() * 255);
     }
   }
-  /**
-   * Builds a promise that is resolved when all the passed in promises are
-   * resolved.
-   * @param {array} array of data and/or promises to wait for.
-   * @return {Promise} New dependant promise.
-   */
-  Promise.all = function Promise_all(promises) {
-    var resolveAll, rejectAll;
-    var deferred = new Promise(function (resolve, reject) {
-      resolveAll = resolve;
-      rejectAll = reject;
-    });
-    var unresolved = promises.length;
-    var results = [];
-    if (unresolved === 0) {
-      resolveAll(results);
-      return deferred;
-    }
-    function reject(reason) {
-      if (deferred._status === STATUS_REJECTED) {
-        return;
-      }
-      results = [];
-      rejectAll(reason);
-    }
-    for (var i = 0, ii = promises.length; i < ii; ++i) {
-      var promise = promises[i];
-      var resolve = (function(i) {
-        return function(value) {
-          if (deferred._status === STATUS_REJECTED) {
-            return;
-          }
-          results[i] = value;
-          unresolved--;
-          if (unresolved === 0) {
-            resolveAll(results);
-          }
-        };
-      })(i);
-      if (Promise.isPromise(promise)) {
-        promise.then(resolve, reject);
-      } else {
-        resolve(promise);
-      }
-    }
-    return deferred;
-  };
+  return bytesToString(buf);
+}
 
-  /**
-   * Checks if the value is likely a promise (has a 'then' function).
-   * @return {boolean} true if value is thenable
-   */
-  Promise.isPromise = function Promise_isPromise(value) {
-    return value && typeof value.then === 'function';
-  };
+const AnnotationPrefix = "pdfjs_internal_id_";
 
-  /**
-   * Creates resolved promise
-   * @param value resolve value
-   * @returns {Promise}
-   */
-  Promise.resolve = function Promise_resolve(value) {
-    return new Promise(function (resolve) { resolve(value); });
-  };
-
-  /**
-   * Creates rejected promise
-   * @param reason rejection value
-   * @returns {Promise}
-   */
-  Promise.reject = function Promise_reject(reason) {
-    return new Promise(function (resolve, reject) { reject(reason); });
-  };
-
-  Promise.prototype = {
-    _status: null,
-    _value: null,
-    _handlers: null,
-    _unhandledRejection: null,
-
-    _updateStatus: function Promise__updateStatus(status, value) {
-      if (this._status === STATUS_RESOLVED ||
-          this._status === STATUS_REJECTED) {
-        return;
-      }
-
-      if (status == STATUS_RESOLVED &&
-          Promise.isPromise(value)) {
-        value.then(this._updateStatus.bind(this, STATUS_RESOLVED),
-                   this._updateStatus.bind(this, STATUS_REJECTED));
-        return;
-      }
-
-      this._status = status;
-      this._value = value;
-
-      if (status === STATUS_REJECTED && this._handlers.length === 0) {
-        this._unhandledRejection = true;
-        HandlerManager.addUnhandledRejection(this);
-      }
-
-      HandlerManager.scheduleHandlers(this);
-    },
-
-    _resolve: function Promise_resolve(value) {
-      this._updateStatus(STATUS_RESOLVED, value);
-    },
-
-    _reject: function Promise_reject(reason) {
-      this._updateStatus(STATUS_REJECTED, reason);
-    },
-
-    then: function Promise_then(onResolve, onReject) {
-      var nextPromise = new Promise(function (resolve, reject) {
-        this.resolve = reject;
-        this.reject = reject;
-      });
-      this._handlers.push({
-        thisPromise: this,
-        onResolve: onResolve,
-        onReject: onReject,
-        nextPromise: nextPromise
-      });
-      HandlerManager.scheduleHandlers(this);
-      return nextPromise;
-    },
-
-    catch: function Promise_catch(onReject) {
-      return this.then(undefined, onReject);
-    }
-  };
-
-  globalScope.Promise = Promise;
-//#else
-//throw new Error('DOM Promise is not present');
-//#endif
-})();
-
-var StatTimer = (function StatTimerClosure() {
-  function rpad(str, pad, length) {
-    while (str.length < length) {
-      str += pad;
-    }
-    return str;
-  }
-  function StatTimer() {
-    this.started = {};
-    this.times = [];
-    this.enabled = true;
-  }
-  StatTimer.prototype = {
-    time: function StatTimer_time(name) {
-      if (!this.enabled) {
-        return;
-      }
-      if (name in this.started) {
-        warn('Timer is already running for ' + name);
-      }
-      this.started[name] = Date.now();
-    },
-    timeEnd: function StatTimer_timeEnd(name) {
-      if (!this.enabled) {
-        return;
-      }
-      if (!(name in this.started)) {
-        warn('Timer has not been started for ' + name);
-      }
-      this.times.push({
-        'name': name,
-        'start': this.started[name],
-        'end': Date.now()
-      });
-      // Remove timer from started so it can be called again.
-      delete this.started[name];
-    },
-    toString: function StatTimer_toString() {
-      var i, ii;
-      var times = this.times;
-      var out = '';
-      // Find the longest name for padding purposes.
-      var longest = 0;
-      for (i = 0, ii = times.length; i < ii; ++i) {
-        var name = times[i]['name'];
-        if (name.length > longest) {
-          longest = name.length;
-        }
-      }
-      for (i = 0, ii = times.length; i < ii; ++i) {
-        var span = times[i];
-        var duration = span.end - span.start;
-        out += rpad(span['name'], ' ', longest) + ' ' + duration + 'ms\n';
-      }
-      return out;
-    }
-  };
-  return StatTimer;
-})();
-
-PDFJS.createBlob = function createBlob(data, contentType) {
-  if (typeof Blob !== 'undefined') {
-    return new Blob([data], { type: contentType });
-  }
-  // Blob builder is deprecated in FF14 and removed in FF18.
-  var bb = new MozBlobBuilder();
-  bb.append(data);
-  return bb.getBlob(contentType);
+const FontRenderOps = {
+  BEZIER_CURVE_TO: 0,
+  MOVE_TO: 1,
+  LINE_TO: 2,
+  QUADRATIC_CURVE_TO: 3,
+  RESTORE: 4,
+  SAVE: 5,
+  SCALE: 6,
+  TRANSFORM: 7,
+  TRANSLATE: 8,
 };
 
-PDFJS.createObjectURL = (function createObjectURLClosure() {
-  // Blob/createObjectURL is not available, falling back to data schema.
-  var digits =
-    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
-
-  return function createObjectURL(data, contentType) {
-    if (!PDFJS.disableCreateObjectURL &&
-        typeof URL !== 'undefined' && URL.createObjectURL) {
-      var blob = PDFJS.createBlob(data, contentType);
-      return URL.createObjectURL(blob);
-    }
-
-    var buffer = 'data:' + contentType + ';base64,';
-    for (var i = 0, ii = data.length; i < ii; i += 3) {
-      var b1 = data[i] & 0xFF;
-      var b2 = data[i + 1] & 0xFF;
-      var b3 = data[i + 2] & 0xFF;
-      var d1 = b1 >> 2, d2 = ((b1 & 3) << 4) | (b2 >> 4);
-      var d3 = i + 1 < ii ? ((b2 & 0xF) << 2) | (b3 >> 6) : 64;
-      var d4 = i + 2 < ii ? (b3 & 0x3F) : 64;
-      buffer += digits[d1] + digits[d2] + digits[d3] + digits[d4];
-    }
-    return buffer;
-  };
-})();
-
-function MessageHandler(name, comObj) {
-  this.name = name;
-  this.comObj = comObj;
-  this.callbackIndex = 1;
-  this.postMessageTransfers = true;
-  var callbacksCapabilities = this.callbacksCapabilities = {};
-  var ah = this.actionHandler = {};
-
-  ah['console_log'] = [function ahConsoleLog(data) {
-    console.log.apply(console, data);
-  }];
-  ah['console_error'] = [function ahConsoleError(data) {
-    console.error.apply(console, data);
-  }];
-  ah['_unsupported_feature'] = [function ah_unsupportedFeature(data) {
-    UnsupportedManager.notify(data);
-  }];
-
-  comObj.onmessage = function messageHandlerComObjOnMessage(event) {
-    var data = event.data;
-    if (data.isReply) {
-      var callbackId = data.callbackId;
-      if (data.callbackId in callbacksCapabilities) {
-        var callback = callbacksCapabilities[callbackId];
-        delete callbacksCapabilities[callbackId];
-        if ('error' in data) {
-          callback.reject(data.error);
-        } else {
-          callback.resolve(data.data);
-        }
-      } else {
-        error('Cannot resolve callback ' + callbackId);
-      }
-    } else if (data.action in ah) {
-      var action = ah[data.action];
-      if (data.callbackId) {
-        Promise.resolve().then(function () {
-          return action[0].call(action[1], data.data);
-        }).then(function (result) {
-          comObj.postMessage({
-            isReply: true,
-            callbackId: data.callbackId,
-            data: result
-          });
-        }, function (reason) {
-          comObj.postMessage({
-            isReply: true,
-            callbackId: data.callbackId,
-            error: reason
-          });
-        });
-      } else {
-        action[0].call(action[1], data.data);
-      }
-    } else {
-      error('Unknown action from worker: ' + data.action);
-    }
-  };
-}
-
-MessageHandler.prototype = {
-  on: function messageHandlerOn(actionName, handler, scope) {
-    var ah = this.actionHandler;
-    if (ah[actionName]) {
-      error('There is already an actionName called "' + actionName + '"');
-    }
-    ah[actionName] = [handler, scope];
-  },
-  /**
-   * Sends a message to the comObj to invoke the action with the supplied data.
-   * @param {String} actionName Action to call.
-   * @param {JSON} data JSON data to send.
-   * @param {Array} [transfers] Optional list of transfers/ArrayBuffers
-   */
-  send: function messageHandlerSend(actionName, data, transfers) {
-    var message = {
-      action: actionName,
-      data: data
-    };
-    this.postMessage(message, transfers);
-  },
-  /**
-   * Sends a message to the comObj to invoke the action with the supplied data.
-   * Expects that other side will callback with the response.
-   * @param {String} actionName Action to call.
-   * @param {JSON} data JSON data to send.
-   * @param {Array} [transfers] Optional list of transfers/ArrayBuffers.
-   * @returns {Promise} Promise to be resolved with response data.
-   */
-  sendWithPromise:
-    function messageHandlerSendWithPromise(actionName, data, transfers) {
-    var callbackId = this.callbackIndex++;
-    var message = {
-      action: actionName,
-      data: data,
-      callbackId: callbackId
-    };
-    var capability = createPromiseCapability();
-    this.callbacksCapabilities[callbackId] = capability;
-    try {
-      this.postMessage(message, transfers);
-    } catch (e) {
-      capability.reject(e);
-    }
-    return capability.promise;
-  },
-  /**
-   * Sends raw message to the comObj.
-   * @private
-   * @param message {Object} Raw message.
-   * @param transfers List of transfers/ArrayBuffers, or undefined.
-   */
-  postMessage: function (message, transfers) {
-    if (transfers && this.postMessageTransfers) {
-      this.comObj.postMessage(message, transfers);
-    } else {
-      this.comObj.postMessage(message);
-    }
-  }
+export {
+  AbortException,
+  AnnotationActionEventType,
+  AnnotationBorderStyleType,
+  AnnotationEditorParamsType,
+  AnnotationEditorPrefix,
+  AnnotationEditorType,
+  AnnotationFieldFlag,
+  AnnotationFlag,
+  AnnotationMode,
+  AnnotationPrefix,
+  AnnotationReplyType,
+  AnnotationType,
+  assert,
+  BaseException,
+  BASELINE_FACTOR,
+  bytesToString,
+  CMapCompressionType,
+  createValidAbsoluteUrl,
+  DocumentActionEventType,
+  FeatureTest,
+  FONT_IDENTITY_MATRIX,
+  FontRenderOps,
+  FormatError,
+  getModificationDate,
+  getUuid,
+  getVerbosityLevel,
+  IDENTITY_MATRIX,
+  ImageKind,
+  info,
+  InvalidPDFException,
+  isArrayEqual,
+  isNodeJS,
+  LINE_DESCENT_FACTOR,
+  LINE_FACTOR,
+  MAX_IMAGE_SIZE_TO_CACHE,
+  MissingPDFException,
+  normalizeUnicode,
+  objectFromMap,
+  objectSize,
+  OPS,
+  PageActionEventType,
+  PasswordException,
+  PasswordResponses,
+  PermissionFlag,
+  RenderingIntentFlag,
+  setVerbosityLevel,
+  shadow,
+  string32,
+  stringToBytes,
+  stringToPDFString,
+  stringToUTF8String,
+  TextRenderingMode,
+  UnexpectedResponseException,
+  UnknownErrorException,
+  unreachable,
+  utf8StringToString,
+  Util,
+  VerbosityLevel,
+  warn,
 };
-
-function loadJpegStream(id, imageUrl, objs) {
-  var img = new Image();
-  img.onload = (function loadJpegStream_onloadClosure() {
-    objs.resolve(id, img);
-  });
-  img.onerror = (function loadJpegStream_onerrorClosure() {
-    objs.resolve(id, null);
-    warn('Error during JPEG image loading');
-  });
-  img.src = imageUrl;
-}

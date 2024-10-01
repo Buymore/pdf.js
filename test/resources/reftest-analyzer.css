@@ -35,7 +35,7 @@ Original author: L. David Baron <dbaron@dbaron.org>
 }
 
 html {
-  background-color: #FFF;
+  background-color: #fff;
   font: message-box;
   font-size: 14px;
 }
@@ -48,7 +48,8 @@ a {
   color: #000;
 }
 
-#loading, #viewer {
+#loading,
+#viewer {
   display: none;
 }
 
@@ -74,13 +75,15 @@ a {
   width: 320px;
 }
 
-#images {
-  overflow: auto;
+#imagepane {
   position: fixed;
-  left: 340px;
-  right: 0;
-  top: 10px;
-  bottom: 0;
+  inset: 10px 0 0 340px;
+}
+
+#images {
+  position: absolute;
+  inset: 22px 0 0;
+  overflow: auto;
 }
 
 #imgcontrols {
@@ -88,8 +91,10 @@ a {
   display: block;
 }
 
-#itemtable, #itemtable td, #itemtable th {
-  border: 1px solid #CCC;
+#itemtable,
+#itemtable td,
+#itemtable th {
+  border: 1px solid #ccc;
   padding: 0;
 }
 
@@ -108,7 +113,7 @@ a {
 }
 
 #itemtable td.selected {
-  background-color: #DDD;
+  background-color: #ddd;
 }
 
 #magnification > svg {
@@ -172,6 +177,12 @@ a {
   margin-top: 1em;
 }
 
-#referenceImage, #differences {
+#referenceImage,
+#differences {
   margin: 0 0 10px 20px;
+}
+
+#shortcuts {
+  float: right;
+  font-size: 10px;
 }

@@ -4,7 +4,7 @@
 *.css        text eol=lf
 *.html       text eol=lf
 *.md         text eol=lf
-*.properties text eol=lf
+*.ftl        text eol=lf
 *.yml        text eol=lf
 *.json       text eol=lf
 *.config     text eol=lf
@@ -16,3 +16,8 @@
 
 # PDF files shall not modify CRLF line endings
 *.pdf -crlf
+
+# Linguist language overrides
+*.js linguist-language=JavaScript
+*.jsm linguist-language=JavaScript
+*.inc linguist-language=XML

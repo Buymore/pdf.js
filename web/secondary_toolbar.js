@@ -1,5 +1,3 @@
-/* -*- Mode: Java; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
-/* vim: set shiftwidth=2 tabstop=2 autoindent cindent expandtab: */
 /* Copyright 2012 Mozilla Foundation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,149 +12,312 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-/* globals PDFView, SCROLLBAR_PADDING */
 
-'use strict';
+/** @typedef {import("./event_utils.js").EventBus} EventBus */
 
-var SecondaryToolbar = {
-  opened: false,
-  previousContainerHeight: null,
-  newContainerHeight: null,
+import {
+  CursorTool,
+  ScrollMode,
+  SpreadMode,
+  toggleCheckedBtn,
+  toggleExpandedBtn,
+} from "./ui_utils.js";
+import { PagesCountLimit } from "./pdf_viewer.js";
 
-  initialize: function secondaryToolbarInitialize(options) {
-    this.toolbar = options.toolbar;
-    this.presentationMode = options.presentationMode;
-    this.documentProperties = options.documentProperties;
-    this.buttonContainer = this.toolbar.firstElementChild;
+/**
+ * @typedef {Object} SecondaryToolbarOptions
+ * @property {HTMLDivElement} toolbar - Container for the secondary toolbar.
+ * @property {HTMLButtonElement} toggleButton - Button to toggle the visibility
+ *   of the secondary toolbar.
+ * @property {HTMLButtonElement} presentationModeButton - Button for entering
+ *   presentation mode.
+ * @property {HTMLButtonElement} openFileButton - Button to open a file.
+ * @property {HTMLButtonElement} printButton - Button to print the document.
+ * @property {HTMLButtonElement} downloadButton - Button to download the
+ *   document.
+ * @property {HTMLAnchorElement} viewBookmarkButton - Button to obtain a
+ *   bookmark link to the current location in the document.
+ * @property {HTMLButtonElement} firstPageButton - Button to go to the first
+ *   page in the document.
+ * @property {HTMLButtonElement} lastPageButton - Button to go to the last page
+ *   in the document.
+ * @property {HTMLButtonElement} pageRotateCwButton - Button to rotate the pages
+ *   clockwise.
+ * @property {HTMLButtonElement} pageRotateCcwButton - Button to rotate the
+ *   pages counterclockwise.
+ * @property {HTMLButtonElement} cursorSelectToolButton - Button to enable the
+ *   select tool.
+ * @property {HTMLButtonElement} cursorHandToolButton - Button to enable the
+ *   hand tool.
+ * @property {HTMLButtonElement} imageAltTextSettingsButton - Button for opening
+ *   the image alt-text settings dialog.
+ * @property {HTMLButtonElement} documentPropertiesButton - Button for opening
+ *   the document properties dialog.
+ */
 
-    // Define the toolbar buttons.
-    this.toggleButton = options.toggleButton;
-    this.presentationModeButton = options.presentationModeButton;
-    this.openFile = options.openFile;
-    this.print = options.print;
-    this.download = options.download;
-    this.viewBookmark = options.viewBookmark;
-    this.firstPage = options.firstPage;
-    this.lastPage = options.lastPage;
-    this.pageRotateCw = options.pageRotateCw;
-    this.pageRotateCcw = options.pageRotateCcw;
-    this.documentPropertiesButton = options.documentPropertiesButton;
+class SecondaryToolbar {
+  #opts;
 
-    // Attach the event listeners.
-    var elements = [
-      // Button to toggle the visibility of the secondary toolbar:
-      { element: this.toggleButton, handler: this.toggle },
-      // All items within the secondary toolbar
-      // (except for toggleHandTool, hand_tool.js is responsible for it):
-      { element: this.presentationModeButton,
-        handler: this.presentationModeClick },
-      { element: this.openFile, handler: this.openFileClick },
-      { element: this.print, handler: this.printClick },
-      { element: this.download, handler: this.downloadClick },
-      { element: this.viewBookmark, handler: this.viewBookmarkClick },
-      { element: this.firstPage, handler: this.firstPageClick },
-      { element: this.lastPage, handler: this.lastPageClick },
-      { element: this.pageRotateCw, handler: this.pageRotateCwClick },
-      { element: this.pageRotateCcw, handler: this.pageRotateCcwClick },
-      { element: this.documentPropertiesButton,
-        handler: this.documentPropertiesClick }
+  /**
+   * @param {SecondaryToolbarOptions} options
+   * @param {EventBus} eventBus
+   */
+  constructor(options, eventBus) {
+    this.#opts = options;
+    const buttons = [
+      {
+        element: options.presentationModeButton,
+        eventName: "presentationmode",
+        close: true,
+      },
+      { element: options.printButton, eventName: "print", close: true },
+      { element: options.downloadButton, eventName: "download", close: true },
+      { element: options.viewBookmarkButton, eventName: null, close: true },
+      { element: options.firstPageButton, eventName: "firstpage", close: true },
+      { element: options.lastPageButton, eventName: "lastpage", close: true },
+      {
+        element: options.pageRotateCwButton,
+        eventName: "rotatecw",
+        close: false,
+      },
+      {
+        element: options.pageRotateCcwButton,
+        eventName: "rotateccw",
+        close: false,
+      },
+      {
+        element: options.cursorSelectToolButton,
+        eventName: "switchcursortool",
+        eventDetails: { tool: CursorTool.SELECT },
+        close: true,
+      },
+      {
+        element: options.cursorHandToolButton,
+        eventName: "switchcursortool",
+        eventDetails: { tool: CursorTool.HAND },
+        close: true,
+      },
+      {
+        element: options.scrollPageButton,
+        eventName: "switchscrollmode",
+        eventDetails: { mode: ScrollMode.PAGE },
+        close: true,
+      },
+      {
+        element: options.scrollVerticalButton,
+        eventName: "switchscrollmode",
+        eventDetails: { mode: ScrollMode.VERTICAL },
+        close: true,
+      },
+      {
+        element: options.scrollHorizontalButton,
+        eventName: "switchscrollmode",
+        eventDetails: { mode: ScrollMode.HORIZONTAL },
+        close: true,
+      },
+      {
+        element: options.scrollWrappedButton,
+        eventName: "switchscrollmode",
+        eventDetails: { mode: ScrollMode.WRAPPED },
+        close: true,
+      },
+      {
+        element: options.spreadNoneButton,
+        eventName: "switchspreadmode",
+        eventDetails: { mode: SpreadMode.NONE },
+        close: true,
+      },
+      {
+        element: options.spreadOddButton,
+        eventName: "switchspreadmode",
+        eventDetails: { mode: SpreadMode.ODD },
+        close: true,
+      },
+      {
+        element: options.spreadEvenButton,
+        eventName: "switchspreadmode",
+        eventDetails: { mode: SpreadMode.EVEN },
+        close: true,
+      },
+      {
+        element: options.imageAltTextSettingsButton,
+        eventName: "imagealttextsettings",
+        close: true,
+      },
+      {
+        element: options.documentPropertiesButton,
+        eventName: "documentproperties",
+        close: true,
+      },
     ];
-
-    for (var item in elements) {
-      var element = elements[item].element;
-      if (element) {
-        element.addEventListener('click', elements[item].handler.bind(this));
-      }
+    if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
+      buttons.push({
+        element: options.openFileButton,
+        eventName: "openfile",
+        close: true,
+      });
     }
-  },
 
-  // Event handling functions.
-  presentationModeClick: function secondaryToolbarPresentationModeClick(evt) {
-    this.presentationMode.request();
-    this.close();
-  },
+    this.eventBus = eventBus;
+    this.opened = false;
 
-  openFileClick: function secondaryToolbarOpenFileClick(evt) {
-    document.getElementById('fileInput').click();
-    this.close();
-  },
+    // Bind the event listeners for click, cursor tool, and scroll/spread mode
+    // actions.
+    this.#bindListeners(buttons);
 
-  printClick: function secondaryToolbarPrintClick(evt) {
-    window.print();
-    this.close();
-  },
+    this.reset();
+  }
 
-  downloadClick: function secondaryToolbarDownloadClick(evt) {
-    PDFView.download();
-    this.close();
-  },
+  /**
+   * @type {boolean}
+   */
+  get isOpen() {
+    return this.opened;
+  }
 
-  viewBookmarkClick: function secondaryToolbarViewBookmarkClick(evt) {
-    this.close();
-  },
+  setPageNumber(pageNumber) {
+    this.pageNumber = pageNumber;
+    this.#updateUIState();
+  }
 
-  firstPageClick: function secondaryToolbarFirstPageClick(evt) {
-    PDFView.page = 1;
-    this.close();
-  },
+  setPagesCount(pagesCount) {
+    this.pagesCount = pagesCount;
+    this.#updateUIState();
+  }
 
-  lastPageClick: function secondaryToolbarLastPageClick(evt) {
-    PDFView.page = PDFView.pdfDocument.numPages;
-    this.close();
-  },
+  reset() {
+    this.pageNumber = 0;
+    this.pagesCount = 0;
+    this.#updateUIState();
 
-  pageRotateCwClick: function secondaryToolbarPageRotateCwClick(evt) {
-    PDFView.rotatePages(90);
-  },
+    // Reset the Scroll/Spread buttons too, since they're document specific.
+    this.eventBus.dispatch("switchcursortool", { source: this, reset: true });
+    this.#scrollModeChanged({ mode: ScrollMode.VERTICAL });
+    this.#spreadModeChanged({ mode: SpreadMode.NONE });
+  }
 
-  pageRotateCcwClick: function secondaryToolbarPageRotateCcwClick(evt) {
-    PDFView.rotatePages(-90);
-  },
+  #updateUIState() {
+    const {
+      firstPageButton,
+      lastPageButton,
+      pageRotateCwButton,
+      pageRotateCcwButton,
+    } = this.#opts;
 
-  documentPropertiesClick: function secondaryToolbarDocumentPropsClick(evt) {
-    this.documentProperties.open();
-    this.close();
-  },
+    firstPageButton.disabled = this.pageNumber <= 1;
+    lastPageButton.disabled = this.pageNumber >= this.pagesCount;
+    pageRotateCwButton.disabled = this.pagesCount === 0;
+    pageRotateCcwButton.disabled = this.pagesCount === 0;
+  }
 
-  // Misc. functions for interacting with the toolbar.
-  setMaxHeight: function secondaryToolbarSetMaxHeight(container) {
-    if (!container || !this.buttonContainer) {
-      return;
+  #bindListeners(buttons) {
+    const { eventBus } = this;
+    const { toggleButton } = this.#opts;
+    // Button to toggle the visibility of the secondary toolbar.
+    toggleButton.addEventListener("click", this.toggle.bind(this));
+
+    // All items within the secondary toolbar.
+    for (const { element, eventName, close, eventDetails } of buttons) {
+      element.addEventListener("click", evt => {
+        if (eventName !== null) {
+          eventBus.dispatch(eventName, { source: this, ...eventDetails });
+        }
+        if (close) {
+          this.close();
+        }
+        eventBus.dispatch("reporttelemetry", {
+          source: this,
+          details: {
+            type: "buttons",
+            data: { id: element.id },
+          },
+        });
+      });
     }
-    this.newContainerHeight = container.clientHeight;
-    if (this.previousContainerHeight === this.newContainerHeight) {
-      return;
-    }
-    this.buttonContainer.setAttribute('style',
-      'max-height: ' + (this.newContainerHeight - SCROLLBAR_PADDING) + 'px;');
-    this.previousContainerHeight = this.newContainerHeight;
-  },
 
-  open: function secondaryToolbarOpen() {
+    eventBus._on("cursortoolchanged", this.#cursorToolChanged.bind(this));
+    eventBus._on("scrollmodechanged", this.#scrollModeChanged.bind(this));
+    eventBus._on("spreadmodechanged", this.#spreadModeChanged.bind(this));
+  }
+
+  #cursorToolChanged({ tool, disabled }) {
+    const { cursorSelectToolButton, cursorHandToolButton } = this.#opts;
+
+    toggleCheckedBtn(cursorSelectToolButton, tool === CursorTool.SELECT);
+    toggleCheckedBtn(cursorHandToolButton, tool === CursorTool.HAND);
+
+    cursorSelectToolButton.disabled = disabled;
+    cursorHandToolButton.disabled = disabled;
+  }
+
+  #scrollModeChanged({ mode }) {
+    const {
+      scrollPageButton,
+      scrollVerticalButton,
+      scrollHorizontalButton,
+      scrollWrappedButton,
+      spreadNoneButton,
+      spreadOddButton,
+      spreadEvenButton,
+    } = this.#opts;
+
+    toggleCheckedBtn(scrollPageButton, mode === ScrollMode.PAGE);
+    toggleCheckedBtn(scrollVerticalButton, mode === ScrollMode.VERTICAL);
+    toggleCheckedBtn(scrollHorizontalButton, mode === ScrollMode.HORIZONTAL);
+    toggleCheckedBtn(scrollWrappedButton, mode === ScrollMode.WRAPPED);
+
+    // Permanently *disable* the Scroll buttons when PAGE-scrolling is being
+    // enforced for *very* long/large documents; please see the `BaseViewer`.
+    const forceScrollModePage =
+      this.pagesCount > PagesCountLimit.FORCE_SCROLL_MODE_PAGE;
+    scrollPageButton.disabled = forceScrollModePage;
+    scrollVerticalButton.disabled = forceScrollModePage;
+    scrollHorizontalButton.disabled = forceScrollModePage;
+    scrollWrappedButton.disabled = forceScrollModePage;
+
+    // Temporarily *disable* the Spread buttons when horizontal scrolling is
+    // enabled, since the non-default Spread modes doesn't affect the layout.
+    const isHorizontal = mode === ScrollMode.HORIZONTAL;
+    spreadNoneButton.disabled = isHorizontal;
+    spreadOddButton.disabled = isHorizontal;
+    spreadEvenButton.disabled = isHorizontal;
+  }
+
+  #spreadModeChanged({ mode }) {
+    const { spreadNoneButton, spreadOddButton, spreadEvenButton } = this.#opts;
+
+    toggleCheckedBtn(spreadNoneButton, mode === SpreadMode.NONE);
+    toggleCheckedBtn(spreadOddButton, mode === SpreadMode.ODD);
+    toggleCheckedBtn(spreadEvenButton, mode === SpreadMode.EVEN);
+  }
+
+  open() {
     if (this.opened) {
       return;
     }
     this.opened = true;
-    this.toggleButton.classList.add('toggled');
-    this.toolbar.classList.remove('hidden');
-  },
 
-  close: function secondaryToolbarClose(target) {
+    const { toggleButton, toolbar } = this.#opts;
+    toggleExpandedBtn(toggleButton, true, toolbar);
+  }
+
+  close() {
     if (!this.opened) {
-      return;
-    } else if (target && !this.toolbar.contains(target)) {
       return;
     }
     this.opened = false;
-    this.toolbar.classList.add('hidden');
-    this.toggleButton.classList.remove('toggled');
-  },
 
-  toggle: function secondaryToolbarToggle() {
+    const { toggleButton, toolbar } = this.#opts;
+    toggleExpandedBtn(toggleButton, false, toolbar);
+  }
+
+  toggle() {
     if (this.opened) {
       this.close();
     } else {
       this.open();
     }
   }
-};
+}
+
+export { SecondaryToolbar };

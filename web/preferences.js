@@ -1,5 +1,3 @@
-/* -*- Mode: Java; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
-/* vim: set shiftwidth=2 tabstop=2 autoindent cindent expandtab: */
 /* Copyright 2013 Mozilla Foundation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,182 +12,132 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-/* globals DEFAULT_PREFERENCES, Promise */
 
-'use strict';
-
-//#include default_preferences.js
-
-var SidebarView = {
-  NONE: 0,
-  THUMBS: 1,
-  OUTLINE: 2,
-  ATTACHMENTS: 3
-};
+import { AppOptions, OptionKind } from "./app_options.js";
 
 /**
- * Preferences - Utility for storing persistent settings.
+ * BasePreferences - Abstract base class for storing persistent settings.
  *   Used for settings that should be applied to all opened documents,
  *   or every time the viewer is loaded.
  */
-var Preferences = {
-  prefs: Object.create(DEFAULT_PREFERENCES),
-  isInitializedPromiseResolved: false,
-  initializedPromise: null,
+class BasePreferences {
+  #defaults = Object.freeze(
+    typeof PDFJSDev === "undefined"
+      ? AppOptions.getAll(OptionKind.PREFERENCE, /* defaultOnly = */ true)
+      : PDFJSDev.eval("DEFAULT_PREFERENCES")
+  );
 
-  /**
-   * Initialize and fetch the current preference values from storage.
-   * @return {Promise} A promise that is resolved when the preferences
-   *                   have been initialized.
-   */
-  initialize: function preferencesInitialize() {
-    return this.initializedPromise =
-        this._readFromStorage(DEFAULT_PREFERENCES).then(function(prefObj) {
-      this.isInitializedPromiseResolved = true;
-      if (prefObj) {
-        this.prefs = prefObj;
+  #initializedPromise = null;
+
+  constructor() {
+    if (
+      (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) &&
+      this.constructor === BasePreferences
+    ) {
+      throw new Error("Cannot initialize BasePreferences.");
+    }
+
+    if (typeof PDFJSDev !== "undefined" && PDFJSDev.test("CHROME")) {
+      Object.defineProperty(this, "defaults", {
+        get() {
+          return this.#defaults;
+        },
+      });
+    }
+
+    this.#initializedPromise = this._readFromStorage(this.#defaults).then(
+      ({ browserPrefs, prefs }) => {
+        if (
+          (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) &&
+          AppOptions._checkDisablePreferences()
+        ) {
+          return;
+        }
+        AppOptions.setAll({ ...browserPrefs, ...prefs }, /* prefs = */ true);
       }
-    }.bind(this));
-  },
+    );
+
+    if (typeof PDFJSDev !== "undefined" && PDFJSDev.test("MOZCENTRAL")) {
+      window.addEventListener(
+        "updatedPreference",
+        async ({ detail: { name, value } }) => {
+          await this.#initializedPromise;
+          AppOptions.setAll({ [name]: value }, /* prefs = */ true);
+        }
+      );
+    }
+  }
 
   /**
    * Stub function for writing preferences to storage.
-   * NOTE: This should be overridden by a build-specific function defined below.
    * @param {Object} prefObj The preferences that should be written to storage.
-   * @return {Promise} A promise that is resolved when the preference values
-   *                   have been written.
+   * @returns {Promise} A promise that is resolved when the preference values
+   *                    have been written.
    */
-  _writeToStorage: function preferences_writeToStorage(prefObj) {
-    return Promise.resolve();
-  },
+  async _writeToStorage(prefObj) {
+    throw new Error("Not implemented: _writeToStorage");
+  }
 
   /**
    * Stub function for reading preferences from storage.
-   * NOTE: This should be overridden by a build-specific function defined below.
    * @param {Object} prefObj The preferences that should be read from storage.
-   * @return {Promise} A promise that is resolved with an {Object} containing
-   *                   the preferences that have been read.
+   * @returns {Promise} A promise that is resolved with an {Object} containing
+   *                    the preferences that have been read.
    */
-  _readFromStorage: function preferences_readFromStorage(prefObj) {
-    return Promise.resolve();
-  },
+  async _readFromStorage(prefObj) {
+    throw new Error("Not implemented: _readFromStorage");
+  }
 
   /**
    * Reset the preferences to their default values and update storage.
-   * @return {Promise} A promise that is resolved when the preference values
-   *                   have been reset.
+   * @returns {Promise} A promise that is resolved when the preference values
+   *                    have been reset.
    */
-  reset: function preferencesReset() {
-    return this.initializedPromise.then(function() {
-      this.prefs = Object.create(DEFAULT_PREFERENCES);
-      return this._writeToStorage(DEFAULT_PREFERENCES);
-    }.bind(this));
-  },
+  async reset() {
+    if (typeof PDFJSDev !== "undefined" && PDFJSDev.test("MOZCENTRAL")) {
+      throw new Error("Please use `about:config` to change preferences.");
+    }
+    await this.#initializedPromise;
+    AppOptions.setAll(this.#defaults, /* prefs = */ true);
 
-  /**
-   * Replace the current preference values with the ones from storage.
-   * @return {Promise} A promise that is resolved when the preference values
-   *                   have been updated.
-   */
-  reload: function preferencesReload() {
-    return this.initializedPromise.then(function () {
-      this._readFromStorage(DEFAULT_PREFERENCES).then(function(prefObj) {
-        if (prefObj) {
-          this.prefs = prefObj;
-        }
-      }.bind(this));
-    }.bind(this));
-  },
+    await this._writeToStorage(this.#defaults);
+  }
 
   /**
    * Set the value of a preference.
    * @param {string} name The name of the preference that should be changed.
    * @param {boolean|number|string} value The new value of the preference.
-   * @return {Promise} A promise that is resolved when the value has been set,
-   *                   provided that the preference exists and the types match.
+   * @returns {Promise} A promise that is resolved when the value has been set,
+   *                    provided that the preference exists and the types match.
    */
-  set: function preferencesSet(name, value) {
-    return this.initializedPromise.then(function () {
-      if (DEFAULT_PREFERENCES[name] === undefined) {
-        throw new Error('preferencesSet: \'' + name + '\' is undefined.');
-      } else if (value === undefined) {
-        throw new Error('preferencesSet: no value is specified.');
-      }
-      var valueType = typeof value;
-      var defaultType = typeof DEFAULT_PREFERENCES[name];
+  async set(name, value) {
+    await this.#initializedPromise;
+    AppOptions.setAll({ [name]: value }, /* prefs = */ true);
 
-      if (valueType !== defaultType) {
-        if (valueType === 'number' && defaultType === 'string') {
-          value = value.toString();
-        } else {
-          throw new Error('Preferences_set: \'' + value + '\' is a \"' +
-                          valueType + '\", expected \"' + defaultType + '\".');
-        }
-      } else {
-        if (valueType === 'number' && (value | 0) !== value) {
-          throw new Error('Preferences_set: \'' + value +
-                          '\' must be an \"integer\".');
-        }
-      }
-      this.prefs[name] = value;
-      return this._writeToStorage(this.prefs);
-    }.bind(this));
-  },
+    await this._writeToStorage(
+      typeof PDFJSDev !== "undefined" && PDFJSDev.test("MOZCENTRAL")
+        ? { [name]: AppOptions.get(name) }
+        : AppOptions.getAll(OptionKind.PREFERENCE)
+    );
+  }
 
   /**
    * Get the value of a preference.
    * @param {string} name The name of the preference whose value is requested.
-   * @return {Promise} A promise that is resolved with a {boolean|number|string}
-   *                   containing the value of the preference.
+   * @returns {Promise} A promise resolved with a {boolean|number|string}
+   *                    containing the value of the preference.
    */
-  get: function preferencesGet(name) {
-    return this.initializedPromise.then(function () {
-      var defaultValue = DEFAULT_PREFERENCES[name];
-
-      if (defaultValue === undefined) {
-        throw new Error('preferencesGet: \'' + name + '\' is undefined.');
-      } else {
-        var prefValue = this.prefs[name];
-
-        if (prefValue !== undefined) {
-          return prefValue;
-        }
-      }
-      return defaultValue;
-    }.bind(this));
+  async get(name) {
+    if (typeof PDFJSDev !== "undefined" && PDFJSDev.test("MOZCENTRAL")) {
+      throw new Error("Not implemented: get");
+    }
+    await this.#initializedPromise;
+    return AppOptions.get(name);
   }
-};
 
-//#if B2G
-//Preferences._writeToStorage = function (prefObj) {
-//  return new Promise(function (resolve) {
-//    asyncStorage.setItem('pdfjs.preferences', JSON.stringify(prefObj),
-//                         resolve);
-//  });
-//};
-//
-//Preferences._readFromStorage = function (prefObj) {
-//  return new Promise(function (resolve) {
-//    asyncStorage.getItem('pdfjs.preferences', function (prefStr) {
-//      var readPrefs = JSON.parse(prefStr);
-//      resolve(readPrefs);
-//    });
-//  });
-//};
-//#endif
+  get initializedPromise() {
+    return this.#initializedPromise;
+  }
+}
 
-//#if !(FIREFOX || MOZCENTRAL || B2G)
-Preferences._writeToStorage = function (prefObj) {
-  return new Promise(function (resolve) {
-    localStorage.setItem('pdfjs.preferences', JSON.stringify(prefObj));
-    resolve();
-  });
-};
-
-Preferences._readFromStorage = function (prefObj) {
-  return new Promise(function (resolve) {
-    var readPrefs = JSON.parse(localStorage.getItem('pdfjs.preferences'));
-    resolve(readPrefs);
-  });
-};
-//#endif
+export { BasePreferences };

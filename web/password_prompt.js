@@ -1,5 +1,3 @@
-/* -*- Mode: Java; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
-/* vim: set shiftwidth=2 tabstop=2 autoindent cindent expandtab: */
 /* Copyright 2012 Mozilla Foundation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,68 +12,118 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-/* globals PDFJS, mozL10n, OverlayManager */
 
-'use strict';
+/** @typedef {import("./overlay_manager.js").OverlayManager} OverlayManager */
 
-var PasswordPrompt = {
-  overlayName: null,
-  updatePassword: null,
-  reason: null,
-  passwordField: null,
-  passwordText: null,
-  passwordSubmit: null,
-  passwordCancel: null,
+import { PasswordResponses } from "pdfjs-lib";
 
-  initialize: function secondaryToolbarInitialize(options) {
-    this.overlayName = options.overlayName;
-    this.passwordField = options.passwordField;
-    this.passwordText = options.passwordText;
-    this.passwordSubmit = options.passwordSubmit;
-    this.passwordCancel = options.passwordCancel;
+/**
+ * @typedef {Object} PasswordPromptOptions
+ * @property {HTMLDialogElement} dialog - The overlay's DOM element.
+ * @property {HTMLParagraphElement} label - Label containing instructions for
+ *                                          entering the password.
+ * @property {HTMLInputElement} input - Input field for entering the password.
+ * @property {HTMLButtonElement} submitButton - Button for submitting the
+ *                                              password.
+ * @property {HTMLButtonElement} cancelButton - Button for cancelling password
+ *                                              entry.
+ */
+
+class PasswordPrompt {
+  #activeCapability = null;
+
+  #updateCallback = null;
+
+  #reason = null;
+
+  /**
+   * @param {PasswordPromptOptions} options
+   * @param {OverlayManager} overlayManager - Manager for the viewer overlays.
+   * @param {boolean} [isViewerEmbedded] - If the viewer is embedded, in e.g.
+   *   an <iframe> or an <object>. The default value is `false`.
+   */
+  constructor(options, overlayManager, isViewerEmbedded = false) {
+    this.dialog = options.dialog;
+    this.label = options.label;
+    this.input = options.input;
+    this.submitButton = options.submitButton;
+    this.cancelButton = options.cancelButton;
+    this.overlayManager = overlayManager;
+    this._isViewerEmbedded = isViewerEmbedded;
 
     // Attach the event listeners.
-    this.passwordSubmit.addEventListener('click',
-      this.verifyPassword.bind(this));
-
-    this.passwordCancel.addEventListener('click', this.close.bind(this));
-
-    this.passwordField.addEventListener('keydown', function (e) {
-      if (e.keyCode === 13) { // Enter key
-        this.verifyPassword();
+    this.submitButton.addEventListener("click", this.#verify.bind(this));
+    this.cancelButton.addEventListener("click", this.close.bind(this));
+    this.input.addEventListener("keydown", e => {
+      if (e.keyCode === /* Enter = */ 13) {
+        this.#verify();
       }
-    }.bind(this));
+    });
 
-    OverlayManager.register(this.overlayName, this.close.bind(this), true);
-  },
+    this.overlayManager.register(this.dialog, /* canForceClose = */ true);
 
-  open: function passwordPromptOpen() {
-    OverlayManager.open(this.overlayName).then(function () {
-      this.passwordField.focus();
+    this.dialog.addEventListener("close", this.#cancel.bind(this));
+  }
 
-      var promptString = mozL10n.get('password_label', null,
-        'Enter the password to open this PDF file.');
+  async open() {
+    await this.#activeCapability?.promise;
+    this.#activeCapability = Promise.withResolvers();
 
-      if (this.reason === PDFJS.PasswordResponses.INCORRECT_PASSWORD) {
-        promptString = mozL10n.get('password_invalid', null,
-          'Invalid password. Please try again.');
-      }
+    try {
+      await this.overlayManager.open(this.dialog);
+    } catch (ex) {
+      this.#activeCapability.resolve();
+      throw ex;
+    }
 
-      this.passwordText.textContent = promptString;
-    }.bind(this));
-  },
+    const passwordIncorrect =
+      this.#reason === PasswordResponses.INCORRECT_PASSWORD;
 
-  close: function passwordPromptClose() {
-    OverlayManager.close(this.overlayName).then(function () {
-      this.passwordField.value = '';
-    }.bind(this));
-  },
+    if (!this._isViewerEmbedded || passwordIncorrect) {
+      this.input.focus();
+    }
+    this.label.setAttribute(
+      "data-l10n-id",
+      passwordIncorrect ? "pdfjs-password-invalid" : "pdfjs-password-label"
+    );
+  }
 
-  verifyPassword: function passwordPromptVerifyPassword() {
-    var password = this.passwordField.value;
-    if (password && password.length > 0) {
-      this.close();
-      return this.updatePassword(password);
+  async close() {
+    if (this.overlayManager.active === this.dialog) {
+      this.overlayManager.close(this.dialog);
     }
   }
-};
+
+  #verify() {
+    const password = this.input.value;
+    if (password?.length > 0) {
+      this.#invokeCallback(password);
+    }
+  }
+
+  #cancel() {
+    this.#invokeCallback(new Error("PasswordPrompt cancelled."));
+    this.#activeCapability.resolve();
+  }
+
+  #invokeCallback(password) {
+    if (!this.#updateCallback) {
+      return; // Ensure that the callback is only invoked once.
+    }
+    this.close();
+    this.input.value = "";
+
+    this.#updateCallback(password);
+    this.#updateCallback = null;
+  }
+
+  async setUpdateCallback(updateCallback, reason) {
+    if (this.#activeCapability) {
+      await this.#activeCapability.promise;
+    }
+    this.#updateCallback = updateCallback;
+    this.#reason = reason;
+  }
+}
+
+export { PasswordPrompt };
